@@ -183,11 +183,9 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
         load_checkpoint(model, None, best_p1, device)
     else:
         print("WARNING: No Phase 1 checkpoint — random weights")
-
-    # Load + freeze Phase 2 address heads
     addr_heads_path = os.path.join(phase2_dir, "addr_heads.pt")
     if os.path.exists(addr_heads_path):
-        ckpt = torch.load(addr_heads_path, map_location=device)
+        ckpt = torch.load(addr_heads_path, map_location=device, weights_only=False)
         for i, sd in enumerate(ckpt["addr_heads"]):
             model.addr_heads[i].load_state_dict(sd)
         print("Loaded Phase 2 address heads")
@@ -214,13 +212,19 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
     best_loss = float("inf")
     tokens_seen = 0
 
+    # Compute total steps (needed before resume for tokens_seen estimate)
+    tokens_per_step = micro_batch * grad_accum * cfg.max_seq_len
+    total_steps = pcfg.total_tokens // tokens_per_step
+
     if resume:
         latest_path = os.path.join(phase3_dir, "latest.pt")
         if os.path.exists(latest_path):
-            step = load_checkpoint(model, optimizer, latest_path, device)
-
-    tokens_per_step = micro_batch * grad_accum * cfg.max_seq_len
-    total_steps = pcfg.total_tokens // tokens_per_step
+            ckpt = load_checkpoint(model, optimizer, latest_path, device)
+            step = ckpt.get("step", 0)
+            tokens_seen = ckpt.get("tokens_seen", step * tokens_per_step)
+            best_loss = ckpt.get("best_loss", float("inf"))
+            if use_scaler and "scaler" in ckpt and ckpt["scaler"] is not None:
+                scaler.load_state_dict(ckpt["scaler"])
     total_tokens_fmt = f"{pcfg.total_tokens / 1e9:.2f}B"
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -338,6 +342,11 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
                     save_checkpoint(
                         model, optimizer, step, best_loss,
                         os.path.join(phase3_dir, "best.pt"),
+                        extra={
+                            "tokens_seen": tokens_seen,
+                            "best_loss": best_loss,
+                            "scaler": scaler.state_dict() if use_scaler else None,
+                        },
                     )
                 model.train()
 
@@ -345,6 +354,11 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
                 save_checkpoint(
                     model, optimizer, step, accum_loss,
                     os.path.join(phase3_dir, "latest.pt"),
+                    extra={
+                        "tokens_seen": tokens_seen,
+                        "best_loss": best_loss,
+                        "scaler": scaler.state_dict() if use_scaler else None,
+                    },
                 )
 
     except KeyboardInterrupt:
@@ -352,6 +366,11 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
         save_checkpoint(
             model, optimizer, step, accum_loss,
             os.path.join(phase3_dir, "latest.pt"),
+            extra={
+                "tokens_seen": tokens_seen,
+                "best_loss": best_loss,
+                "scaler": scaler.state_dict() if use_scaler else None,
+            },
         )
 
     wall_time = timer.elapsed()

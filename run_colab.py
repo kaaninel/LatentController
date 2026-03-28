@@ -41,7 +41,12 @@ def main():
     parser.add_argument("--phase",          type=int,   required=True, choices=[1, 2, 3, 4])
     parser.add_argument("--checkpoint_dir", type=str,   default="./checkpoints")
     parser.add_argument("--data_dir",       type=str,   default="./data")
-    parser.add_argument("--resume",         action="store_true", help="Resume from latest.pt")
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Resume from latest.pt (default: True; use --no-resume to start fresh)",
+    )
     args = parser.parse_args()
 
     from hardware import detect_hardware, print_hardware_report
@@ -64,7 +69,7 @@ def main():
 
         elif args.phase == 2:
             from train_phase2 import train
-            train(args.checkpoint_dir, args.data_dir)
+            train(args.checkpoint_dir, args.data_dir, resume=args.resume)
 
         elif args.phase == 3:
             from train_phase3 import train

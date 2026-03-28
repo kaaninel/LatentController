@@ -47,14 +47,18 @@ def save_checkpoint(model, optimizer, step: int, loss: float, path: str, extra: 
     print(f"Saved checkpoint → {path}  (step={step}, loss={loss:.4f})")
 
 
-def load_checkpoint(model, optimizer, path: str, device) -> int:
-    ckpt = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt["model"])
+def load_checkpoint(model, optimizer, path: str, device) -> dict:
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    # Strip '_orig_mod.' prefix added by torch.compile so checkpoints saved
+    # from compiled models load correctly into uncompiled models (and vice-versa).
+    state_dict = ckpt["model"]
+    cleaned = {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
+    model.load_state_dict(cleaned, strict=False)
     if optimizer is not None and "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])
     step = ckpt.get("step", 0)
     print(f"Loaded checkpoint from {path}  (step={step})")
-    return step
+    return ckpt  # return full dict so callers can extract tokens_seen, best_loss, etc.
 
 
 # ---------------------------------------------------------------------------
