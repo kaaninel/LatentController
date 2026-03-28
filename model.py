@@ -171,41 +171,29 @@ class LoopedLatentController(nn.Module):
         self.register_buffer("rope_cos", cos)
         self.register_buffer("rope_sin", sin)
 
-        # Attention mask cache: keyed by (n_mem, n_text)
-        self._mask_cache = {}
-
-    # ------------------------------------------------------------------
-    # Asymmetric attention mask
-    # ------------------------------------------------------------------
-
-    def _build_mask(self, n_mem: int, n_text: int, device) -> torch.Tensor:
-        """
-        Memory positions : attend only to other memory positions (block → text).
-        Text positions   : attend to ALL memory + causal over text.
-        Returns (T, T) additive mask (0 = keep, -inf = mask).
-        """
-        T = n_mem + n_text
-        # Start with all-attend
-        mask = torch.zeros(T, T, device=device)
+        # Pre-compute attention masks as registered buffers so that
+        # torch.compile / CUDAGraphs can reference them as stable tensors.
         neg_inf = -1e9
 
-        # Memory rows: block text columns
-        if n_mem > 0 and n_text > 0:
-            mask[:n_mem, n_mem:] = neg_inf
+        # text-only causal mask — used in Phase 1 (no memory)
+        n_text_max = cfg.max_seq_len
+        text_only = torch.triu(
+            torch.full((n_text_max, n_text_max), neg_inf), diagonal=1
+        )
+        self.register_buffer("text_only_mask", text_only)
 
-        # Text rows: causal over text (vectorized, no Python loop)
-        if n_text > 0:
-            text_causal = torch.ones(n_text, n_text, device=device).triu(diagonal=1) * neg_inf
-            mask[n_mem:, n_mem:] = text_causal
-
-        return mask
-
-    def _get_mask(self, n_mem: int, n_text: int, device) -> torch.Tensor:
-        """Return cached mask for the given (n_mem, n_text) dimensions."""
-        key = (n_mem, n_text)
-        if key not in self._mask_cache:
-            self._mask_cache[key] = self._build_mask(n_mem, n_text, device)
-        return self._mask_cache[key]
+        # mem+text asymmetric mask — used in Phases 3/4
+        n_mem_max  = cfg.n_mem_positions    # 11  (<MEM> + slots + </MEM>)
+        n_text_max2 = cfg.n_text_positions  # 501
+        T_max = n_mem_max + n_text_max2     # 512
+        mem_text = torch.zeros(T_max, T_max)
+        # Memory rows: block all text columns
+        mem_text[:n_mem_max, n_mem_max:] = neg_inf
+        # Text rows: causal over text
+        mem_text[n_mem_max:, n_mem_max:] = torch.triu(
+            torch.full((n_text_max2, n_text_max2), neg_inf), diagonal=1
+        )
+        self.register_buffer("mem_text_mask", mem_text)
 
     # ------------------------------------------------------------------
     # Forward
@@ -240,7 +228,10 @@ class LoopedLatentController(nn.Module):
             x = torch.cat([mem_start, memory_vectors, mem_end, x], dim=1)
 
         T = x.shape[1]
-        mask = self._get_mask(n_mem, T_text, device)
+        if n_mem == 0:
+            mask = self.text_only_mask[:T_text, :T_text]
+        else:
+            mask = self.mem_text_mask[:T, :T]
 
         cos = self.rope_cos[:T]
         sin = self.rope_sin[:T]

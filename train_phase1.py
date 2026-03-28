@@ -89,14 +89,19 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
     best_loss = float("inf")
     tokens_seen = 0
 
+    # Compute total steps (needed for tokens_seen estimate on resume)
+    tokens_per_step = micro_batch * grad_accum * cfg.max_seq_len
+    total_steps = pcfg.total_tokens // tokens_per_step
+
     if resume:
         latest_path = os.path.join(save_dir, "latest.pt")
         if os.path.exists(latest_path):
-            step = load_checkpoint(model, optimizer, latest_path, device)
-
-    # Compute total steps
-    tokens_per_step = micro_batch * grad_accum * cfg.max_seq_len
-    total_steps = pcfg.total_tokens // tokens_per_step
+            ckpt = load_checkpoint(model, optimizer, latest_path, device)
+            step = ckpt.get("step", 0)
+            tokens_seen = ckpt.get("tokens_seen", step * tokens_per_step)
+            best_loss = ckpt.get("best_loss", float("inf"))
+            if use_scaler and "scaler" in ckpt and ckpt["scaler"] is not None:
+                scaler.load_state_dict(ckpt["scaler"])
     total_tokens_fmt = f"{pcfg.total_tokens / 1e9:.2f}B"
 
     amp_label = f"{'BF16' if amp_dtype == torch.bfloat16 else 'FP16'} (autocast + GradScaler)" if use_amp else "FP32"
@@ -198,6 +203,11 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
                     save_checkpoint(
                         model, optimizer, step, best_loss,
                         os.path.join(save_dir, "best.pt"),
+                        extra={
+                            "tokens_seen": tokens_seen,
+                            "best_loss": best_loss,
+                            "scaler": scaler.state_dict() if use_scaler else None,
+                        },
                     )
                 model.train()
 
@@ -206,6 +216,11 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
                 save_checkpoint(
                     model, optimizer, step, accum_loss,
                     os.path.join(save_dir, "latest.pt"),
+                    extra={
+                        "tokens_seen": tokens_seen,
+                        "best_loss": best_loss,
+                        "scaler": scaler.state_dict() if use_scaler else None,
+                    },
                 )
 
     except KeyboardInterrupt:
@@ -213,6 +228,11 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
         save_checkpoint(
             model, optimizer, step, accum_loss,
             os.path.join(save_dir, "latest.pt"),
+            extra={
+                "tokens_seen": tokens_seen,
+                "best_loss": best_loss,
+                "scaler": scaler.state_dict() if use_scaler else None,
+            },
         )
 
     wall_time = timer.elapsed()

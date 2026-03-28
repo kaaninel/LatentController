@@ -16,7 +16,7 @@ from config import ModelConfig, Phase2Config
 from hardware import detect_hardware, print_hardware_report
 from model import LoopedLatentController
 from dataset import prepare_data
-from utils import load_checkpoint, Timer, vram_report, peak_vram, format_eta, format_time
+from utils import load_checkpoint, save_checkpoint, Timer, vram_report, peak_vram, format_eta, format_time
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +112,7 @@ def contrastive_loss(
 # Training
 # ---------------------------------------------------------------------------
 
-def train(checkpoint_dir: str, data_dir: str):
+def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
     hw  = detect_hardware()
     print_hardware_report(hw)
     ov  = hw['overrides']
@@ -158,8 +158,6 @@ def train(checkpoint_dir: str, data_dir: str):
         load_checkpoint(model, None, best_p1, device)
     else:
         print("WARNING: No Phase 1 checkpoint found — using random weights")
-
-    # Freeze everything except address heads
     for p in model.parameters():
         p.requires_grad_(False)
     for head in model.addr_heads:
@@ -193,8 +191,16 @@ def train(checkpoint_dir: str, data_dir: str):
     N = hiddens.shape[0]
     model.train()
     timer = Timer()
+    start_step = 0
 
-    for step in range(1, pcfg.steps + 1):
+    # Resume from a partially-completed Phase 2 run if available
+    latest_p2 = os.path.join(phase2_dir, "latest.pt")
+    if resume and os.path.exists(latest_p2):
+        ckpt = load_checkpoint(model, optimizer, latest_p2, device)
+        start_step = ckpt.get("step", 0)
+        print(f"Resuming Phase 2 from step {start_step}")
+
+    for step in range(start_step + 1, pcfg.steps + 1):
         # Random mini-batch
         idx = torch.randperm(N, device=device)[:batch_size]
         batch = hiddens[idx]
@@ -219,12 +225,20 @@ def train(checkpoint_dir: str, data_dir: str):
         if step % 100 == 0:
             elapsed = timer.elapsed()
             pct = 100.0 * step / pcfg.steps
-            eta_secs = (pcfg.steps - step) * (elapsed / max(step, 1))
+            eta_secs = (pcfg.steps - step) * (elapsed / max(step - start_step, 1))
             print(
                 f"[Phase 2] Step {step}/{pcfg.steps} ({pct:.1f}%) | "
                 f"Loss: {loss.item():.4f} | "
                 f"VRAM: {vram_report()} | ETA: {format_eta(eta_secs)} | "
                 f"Elapsed: {format_time(elapsed)}"
+            )
+
+        # Periodic checkpoint for resume support
+        if step % 1000 == 0:
+            save_checkpoint(
+                model, optimizer, step, loss.item(),
+                latest_p2,
+                extra={"addr_heads": [h.state_dict() for h in model.addr_heads]},
             )
 
     wall_time = timer.elapsed()
@@ -252,5 +266,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint_dir", default="./checkpoints")
     parser.add_argument("--data_dir",       default="./data")
+    parser.add_argument("--resume",         action="store_true")
     args = parser.parse_args()
-    train(args.checkpoint_dir, args.data_dir)
+    train(args.checkpoint_dir, args.data_dir, args.resume)
