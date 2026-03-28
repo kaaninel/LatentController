@@ -6,15 +6,17 @@ Freeze the Phase 1 model; train only the 3 address heads.
 
 import os
 import argparse
+import math
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from config import ModelConfig, Phase2Config
+from hardware import detect_hardware, print_hardware_report
 from model import LoopedLatentController
 from dataset import prepare_data
-from utils import load_checkpoint
+from utils import load_checkpoint, Timer, vram_report, peak_vram, format_eta, format_time
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +42,7 @@ def collect_hidden_states(
     for inp, _ in train_loader:
         if seq_count >= n_sequences:
             break
-        inp = inp.to(device)
+        inp = inp.to(device, non_blocking=True)
         _, _, hidden = model(inp, return_hidden=True)
         # hidden: (B, T, d_model) — take text positions only
         # (no memory in phase 1, so all positions are text)
@@ -111,19 +113,41 @@ def contrastive_loss(
 # ---------------------------------------------------------------------------
 
 def train(checkpoint_dir: str, data_dir: str):
+    hw  = detect_hardware()
+    print_hardware_report(hw)
+    ov  = hw['overrides']
+
     cfg  = ModelConfig()
     pcfg = Phase2Config()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Phase 2 training — device: {device}")
+    device = hw['device']
+
+    # Hardware-aware batch size
+    batch_size  = ov['phase2']['batch_size']
+    num_workers = ov['num_workers']
+    pin_memory  = ov['pin_memory']
 
     phase1_dir = os.path.join(checkpoint_dir, "phase1")
     phase2_dir = os.path.join(checkpoint_dir, "phase2")
     os.makedirs(phase2_dir, exist_ok=True)
 
+    print("=" * 64)
+    print("  PHASE 2: Address Head Contrastive Pretraining")
+    print("=" * 64)
+    print(f"  Steps:           {pcfg.steps:,}")
+    print(f"  Batch Size:      {batch_size}")
+    print(f"  Hidden States:   {pcfg.n_hidden_states:,} from {pcfg.n_sequences:,} sequences")
+    if hw['gpu_name']:
+        print(f"  GPU:             {hw['gpu_name']} ({hw['gpu_vram_gb']:.1f} GB VRAM)")
+    print("=" * 64)
+
     # ------------------------------------------------------------------ data
     tok_path = os.path.join(data_dir, "tokenizer.json")
     train_ds, _, _ = prepare_data(tok_path, data_dir, seq_len=cfg.max_seq_len)
-    train_loader   = DataLoader(train_ds, batch_size=16, shuffle=True, num_workers=2)
+    train_loader   = DataLoader(
+        train_ds, batch_size=16, shuffle=True,
+        num_workers=num_workers, pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+    )
 
     # ---------------------------------------------------------------- model
     model = LoopedLatentController(cfg, use_checkpoint=False).to(device)
@@ -168,10 +192,11 @@ def train(checkpoint_dir: str, data_dir: str):
     # Training loop
     N = hiddens.shape[0]
     model.train()
+    timer = Timer()
 
     for step in range(1, pcfg.steps + 1):
         # Random mini-batch
-        idx = torch.randperm(N, device=device)[:pcfg.batch_size]
+        idx = torch.randperm(N, device=device)[:batch_size]
         batch = hiddens[idx]
         sim_batch = cos_sims[idx][:, idx]
 
@@ -187,13 +212,22 @@ def train(checkpoint_dir: str, data_dir: str):
             device,
         )
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
 
         if step % 100 == 0:
-            print(f"  step {step}/{pcfg.steps}  loss={loss.item():.4f}")
+            elapsed = timer.elapsed()
+            pct = 100.0 * step / pcfg.steps
+            eta_secs = (pcfg.steps - step) * (elapsed / max(step, 1))
+            print(
+                f"[Phase 2] Step {step}/{pcfg.steps} ({pct:.1f}%) | "
+                f"Loss: {loss.item():.4f} | "
+                f"VRAM: {vram_report()} | ETA: {format_eta(eta_secs)} | "
+                f"Elapsed: {format_time(elapsed)}"
+            )
 
+    wall_time = timer.elapsed()
     # Save address heads only
     save_path = os.path.join(phase2_dir, "addr_heads.pt")
     torch.save(
@@ -203,7 +237,15 @@ def train(checkpoint_dir: str, data_dir: str):
         },
         save_path,
     )
-    print(f"Phase 2 complete.  Address heads saved → {save_path}")
+
+    print("=" * 64)
+    print("  PHASE 2 COMPLETE")
+    print("=" * 64)
+    print(f"  Total Steps:     {pcfg.steps:,}")
+    print(f"  Wall Time:       {format_time(wall_time)}")
+    print(f"  Peak VRAM:       {peak_vram():.1f} GB")
+    print(f"  Address heads saved → {save_path}")
+    print("=" * 64)
 
 
 if __name__ == "__main__":

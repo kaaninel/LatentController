@@ -44,10 +44,13 @@ def main():
     parser.add_argument("--resume",         action="store_true", help="Resume from latest.pt")
     args = parser.parse_args()
 
+    from hardware import detect_hardware, print_hardware_report
+    hw = detect_hardware()
+    print_hardware_report(hw)
+
     print("=" * 60)
     print(f"  Looped Latent Controller — Phase {args.phase}")
     print("=" * 60)
-    print_device_info()
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     os.makedirs(args.data_dir, exist_ok=True)

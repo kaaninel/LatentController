@@ -62,21 +62,24 @@ def load_checkpoint(model, optimizer, path: str, device) -> int:
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate(model, val_loader, device, max_batches: int = 100) -> dict:
+def evaluate(model, val_loader, device, max_batches: int = 100, amp_dtype=None) -> dict:
     model.eval()
     total_loss = 0.0
     total_tokens = 0
     n_batches = 0
+    use_amp = amp_dtype is not None and device == 'cuda'
     for inp, tgt in val_loader:
-        inp, tgt = inp.to(device), tgt.to(device)
-        logits, _ = model(inp)
-        # logits: (B, T, V)
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            tgt.reshape(-1),
-            ignore_index=0,
-            reduction="sum",
-        )
+        inp = inp.to(device, non_blocking=True)
+        tgt = tgt.to(device, non_blocking=True)
+        with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
+            logits, _ = model(inp)
+            # logits: (B, T, V)
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                tgt.reshape(-1),
+                ignore_index=0,
+                reduction="sum",
+            )
         mask = tgt.reshape(-1) != 0
         total_loss += loss.item()
         total_tokens += mask.sum().item()
@@ -150,3 +153,50 @@ class Timer:
     def reset(self):
         self._start = time.perf_counter()
         self._last = self._start
+
+
+# ---------------------------------------------------------------------------
+# VRAM / timing helpers
+# ---------------------------------------------------------------------------
+
+def vram_report() -> str:
+    """Return VRAM usage string like '11.2/15.9 GB'."""
+    if torch.cuda.is_available():
+        alloc = torch.cuda.memory_allocated() / 1e9
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9
+        return f"{alloc:.1f}/{total:.1f} GB"
+    return "N/A"
+
+
+def peak_vram() -> float:
+    """Return peak VRAM usage in GB."""
+    if torch.cuda.is_available():
+        return torch.cuda.max_memory_allocated() / 1e9
+    return 0.0
+
+
+def format_eta(seconds: float) -> str:
+    """Format seconds as '5h 23m' or '23m 10s'."""
+    if seconds < 0:
+        return "N/A"
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m"
+    elif minutes > 0:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def format_time(seconds: float) -> str:
+    """Format elapsed seconds as '2h 15m 30s'."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    elif minutes > 0:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+

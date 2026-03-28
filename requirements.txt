@@ -2,3 +2,4 @@ torch>=2.0
 datasets
 tokenizers
 numpy
+psutil

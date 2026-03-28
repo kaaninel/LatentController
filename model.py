@@ -18,8 +18,10 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(d_model))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return self.weight * x * rms
+        dtype = x.dtype
+        x_float = x.float()
+        rms = x_float.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return (self.weight * x_float * rms).to(dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -97,10 +99,18 @@ class Attention(nn.Module):
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale      # (B, H, T, T)
-        attn = attn + mask.unsqueeze(0).unsqueeze(0)        # broadcast over B, H
-        attn = F.softmax(attn.float(), dim=-1).to(x.dtype)
-        out = (attn @ v).transpose(1, 2).reshape(B, T, H * D)
+        # Use PyTorch's fused SDPA (dispatches to Flash Attention when available).
+        # Pass the additive float mask (0 = attend, -1e9 = block) directly.
+        attn_mask = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
+
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=False,  # we provide our own asymmetric mask
+        )
+
+        out = out.transpose(1, 2).reshape(B, T, H * D)
         return self.o(out)
 
 
@@ -161,6 +171,9 @@ class LoopedLatentController(nn.Module):
         self.register_buffer("rope_cos", cos)
         self.register_buffer("rope_sin", sin)
 
+        # Attention mask cache: keyed by (n_mem, n_text)
+        self._mask_cache = {}
+
     # ------------------------------------------------------------------
     # Asymmetric attention mask
     # ------------------------------------------------------------------
@@ -172,20 +185,27 @@ class LoopedLatentController(nn.Module):
         Returns (T, T) additive mask (0 = keep, -inf = mask).
         """
         T = n_mem + n_text
+        # Start with all-attend
         mask = torch.zeros(T, T, device=device)
         neg_inf = -1e9
 
-        # Memory rows → block columns that are text positions
+        # Memory rows: block text columns
         if n_mem > 0 and n_text > 0:
             mask[:n_mem, n_mem:] = neg_inf
 
-        # Text rows → causal over text part
-        for i in range(n_text):
-            row = n_mem + i
-            # future text columns
-            mask[row, n_mem + i + 1:] = neg_inf
+        # Text rows: causal over text (vectorized, no Python loop)
+        if n_text > 0:
+            text_causal = torch.ones(n_text, n_text, device=device).triu(diagonal=1) * neg_inf
+            mask[n_mem:, n_mem:] = text_causal
 
         return mask
+
+    def _get_mask(self, n_mem: int, n_text: int, device) -> torch.Tensor:
+        """Return cached mask for the given (n_mem, n_text) dimensions."""
+        key = (n_mem, n_text)
+        if key not in self._mask_cache:
+            self._mask_cache[key] = self._build_mask(n_mem, n_text, device)
+        return self._mask_cache[key]
 
     # ------------------------------------------------------------------
     # Forward
@@ -220,7 +240,7 @@ class LoopedLatentController(nn.Module):
             x = torch.cat([mem_start, memory_vectors, mem_end, x], dim=1)
 
         T = x.shape[1]
-        mask = self._build_mask(n_mem, T_text, device)
+        mask = self._get_mask(n_mem, T_text, device)
 
         cos = self.rope_cos[:T]
         sin = self.rope_sin[:T]
