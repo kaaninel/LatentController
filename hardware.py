@@ -79,10 +79,10 @@ def detect_hardware():
 def _t4_config(info):
     """Tesla T4: 16GB, fp16, 65 TFLOPS fp16"""
     return {
-        'phase1': {'micro_batch': 128, 'grad_accum': 1},
-        'phase2': {'batch_size': 8000},
-        'phase3': {'micro_batch': 96, 'grad_accum': 1},
-        'phase4': {'micro_batch': 48, 'grad_accum': 1},
+        'phase1': {'micro_batch': 64, 'grad_accum': 1},
+        'phase2': {'batch_size': 4000},
+        'phase3': {'micro_batch': 48, 'grad_accum': 1},
+        'phase4': {'micro_batch': 24, 'grad_accum': 1},
         'num_workers': min(4, info['cpu_count']),
         'use_compile': True,
         'use_amp': True,
@@ -94,10 +94,10 @@ def _t4_config(info):
 def _a100_40gb_config(info):
     """A100-40GB: bf16, 312 TFLOPS bf16"""
     return {
-        'phase1': {'micro_batch': 256, 'grad_accum': 1},
-        'phase2': {'batch_size': 16000},
-        'phase3': {'micro_batch': 192, 'grad_accum': 1},
-        'phase4': {'micro_batch': 96, 'grad_accum': 1},
+        'phase1': {'micro_batch': 512, 'grad_accum': 1},
+        'phase2': {'batch_size': 32000},
+        'phase3': {'micro_batch': 384, 'grad_accum': 1},
+        'phase4': {'micro_batch': 192, 'grad_accum': 1},
         'num_workers': min(8, info['cpu_count']),
         'use_compile': True,
         'use_amp': True,
@@ -109,10 +109,10 @@ def _a100_40gb_config(info):
 def _a100_80gb_config(info):
     """A100-80GB: bf16, plenty of room"""
     return {
-        'phase1': {'micro_batch': 512, 'grad_accum': 1},
-        'phase2': {'batch_size': 32000},
-        'phase3': {'micro_batch': 384, 'grad_accum': 1},
-        'phase4': {'micro_batch': 192, 'grad_accum': 1},
+        'phase1': {'micro_batch': 1024, 'grad_accum': 1},
+        'phase2': {'batch_size': 64000},
+        'phase3': {'micro_batch': 768, 'grad_accum': 1},
+        'phase4': {'micro_batch': 384, 'grad_accum': 1},
         'num_workers': min(16, info['cpu_count']),
         'use_compile': True,
         'use_amp': True,
@@ -124,10 +124,10 @@ def _a100_80gb_config(info):
 def _h100_config(info):
     """H100-80GB SXM: bf16, 990 TFLOPS bf16"""
     return {
-        'phase1': {'micro_batch': 512, 'grad_accum': 1},
-        'phase2': {'batch_size': 32000},
-        'phase3': {'micro_batch': 384, 'grad_accum': 1},
-        'phase4': {'micro_batch': 192, 'grad_accum': 1},
+        'phase1': {'micro_batch': 1024, 'grad_accum': 1},
+        'phase2': {'batch_size': 64000},
+        'phase3': {'micro_batch': 768, 'grad_accum': 1},
+        'phase4': {'micro_batch': 384, 'grad_accum': 1},
         'num_workers': min(16, info['cpu_count']),
         'use_compile': True,
         'use_amp': True,
@@ -142,10 +142,10 @@ def _l40_config(info):
     if vram >= 40:
         # L40/L40S (48GB) — comparable to A100-40GB
         return {
-            'phase1': {'micro_batch': 192, 'grad_accum': 1},
-            'phase2': {'batch_size': 12000},
-            'phase3': {'micro_batch': 144, 'grad_accum': 1},
-            'phase4': {'micro_batch': 72, 'grad_accum': 1},
+            'phase1': {'micro_batch': 512, 'grad_accum': 1},
+            'phase2': {'batch_size': 32000},
+            'phase3': {'micro_batch': 384, 'grad_accum': 1},
+            'phase4': {'micro_batch': 192, 'grad_accum': 1},
             'num_workers': min(8, info['cpu_count']),
             'use_compile': True,
             'use_amp': True,
@@ -154,6 +154,24 @@ def _l40_config(info):
         }
     else:
         # L4 (24GB)
+        return {
+            'phase1': {'micro_batch': 256, 'grad_accum': 1},
+            'phase2': {'batch_size': 16000},
+            'phase3': {'micro_batch': 192, 'grad_accum': 1},
+            'phase4': {'micro_batch': 96, 'grad_accum': 1},
+            'num_workers': min(8, info['cpu_count']),
+            'use_compile': True,
+            'use_amp': True,
+            'pin_memory': True,
+            'gradient_checkpointing': False,
+        }
+
+
+def _v100_config(info):
+    """V100: 16GB or 32GB, fp16"""
+    vram = info['gpu_vram_gb']
+    if vram > 20:
+        # V100-32GB
         return {
             'phase1': {'micro_batch': 128, 'grad_accum': 1},
             'phase2': {'batch_size': 8000},
@@ -165,31 +183,30 @@ def _l40_config(info):
             'pin_memory': True,
             'gradient_checkpointing': False,
         }
-
-
-def _v100_config(info):
-    """V100: 32GB fp16"""
-    return {
-        'phase1': {'micro_batch': 192, 'grad_accum': 1},
-        'phase2': {'batch_size': 12000},
-        'phase3': {'micro_batch': 144, 'grad_accum': 1},
-        'phase4': {'micro_batch': 72, 'grad_accum': 1},
-        'num_workers': min(8, info['cpu_count']),
-        'use_compile': True,
-        'use_amp': True,
-        'pin_memory': True,
-        'gradient_checkpointing': False,
-    }
+    else:
+        # V100-16GB
+        return {
+            'phase1': {'micro_batch': 64, 'grad_accum': 1},
+            'phase2': {'batch_size': 4000},
+            'phase3': {'micro_batch': 48, 'grad_accum': 1},
+            'phase4': {'micro_batch': 24, 'grad_accum': 1},
+            'num_workers': min(8, info['cpu_count']),
+            'use_compile': True,
+            'use_amp': True,
+            'pin_memory': True,
+            'gradient_checkpointing': False,
+        }
 
 
 def _rtx_config(info, vram):
     if vram > 20:
-        mb = 128   # RTX 4090 / 3090 (24GB)
+        mb = 256   # RTX 4090 / 3090 (24GB)
     else:
         mb = 64    # RTX 3080/4080 (10-16GB)
     return {
         'phase1': {'micro_batch': mb, 'grad_accum': 1},
-        'phase2': {'batch_size': 8000},
+        # Phase2 batch_size scales ~62.5x phase1 micro_batch (consistent with other GPU configs)
+        'phase2': {'batch_size': mb * 62},
         'phase3': {'micro_batch': mb * 3 // 4, 'grad_accum': 1},
         'phase4': {'micro_batch': mb // 2, 'grad_accum': 1},
         'num_workers': min(8, info['cpu_count']),

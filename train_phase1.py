@@ -146,6 +146,11 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
                 inp = inp.to(device, non_blocking=True)
                 tgt = tgt.to(device, non_blocking=True)
 
+                # Notify CUDAGraphs that a new step is beginning to prevent
+                # tensor-overwrite errors with torch.compile(mode='reduce-overhead').
+                if use_compile and hasattr(torch, 'compiler') and hasattr(torch.compiler, 'cudagraph_mark_step_begin'):
+                    torch.compiler.cudagraph_mark_step_begin()
+
                 with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                     logits, _ = model(inp)
                     loss = F.cross_entropy(
