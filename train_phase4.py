@@ -27,7 +27,7 @@ from utils import (
     get_lr, save_checkpoint, load_checkpoint,
     Timer, vram_report, peak_vram, format_eta, format_time,
 )
-from train_phase3 import memory_vecs_to_tensor, addr_bytes
+from train_phase3 import memory_vecs_to_tensor, addr_bytes, batch_read_memory
 
 
 # ---------------------------------------------------------------------------
@@ -256,21 +256,14 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
                 tgt = tgt.to(device, non_blocking=True)
 
                 try:
-                    # Read memory (per-sample lookup)
+                    # Batch memory read (vectorized)
                     mem_tensor = None
                     if train_memory is not None:
                         with torch.no_grad():
                             _, _, hid_nm = model(inp, return_hidden=True)
-                            mem_list = []
-                            for b in range(inp.size(0)):
-                                h_b = hid_nm[b, -1, :]
-                                addrs_b = model.compute_addresses(h_b)
-                                ab_b = [addr_bytes(a) for a in addrs_b]
-                                mvecs_b = train_memory.read_memory(ab_b)
-                                mem_list.append(
-                                    memory_vecs_to_tensor(mvecs_b, cfg.d_model, device)
-                                )
-                            mem_tensor = torch.cat(mem_list, dim=0)  # (B, n_mem, d_model)
+                            h_last = hid_nm[:, -1, :]  # (B, d_model)
+                            mem_tensor = batch_read_memory(
+                                model, h_last, train_memory, cfg, device)
 
                     with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                         weighted_logits, expected_steps, counts = act_forward(
@@ -334,6 +327,8 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
                 halt_hist.clear()
 
             if step % pcfg.save_interval == 0:
+                if train_memory is not None:
+                    train_memory.flush_to_disk()
                 save_checkpoint(
                     model, optimizer, step, accum_loss,
                     os.path.join(phase4_dir, "latest.pt"),
@@ -347,6 +342,8 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
 
     except KeyboardInterrupt:
         print("\nInterrupted — saving…")
+        if train_memory is not None:
+            train_memory.flush_to_disk()
         save_checkpoint(
             model, optimizer, step, accum_loss,
             os.path.join(phase4_dir, "latest.pt"),
@@ -357,6 +354,8 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
             },
         )
 
+    if train_memory is not None:
+        train_memory.flush_to_disk()
     wall_time = timer.elapsed()
     print("=" * 64)
     print("  PHASE 4 COMPLETE")

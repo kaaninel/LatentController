@@ -273,3 +273,17 @@ class LoopedLatentController(nn.Module):
             addr = (raw / scale * 127.0).round().clamp(-128, 127).to(torch.int8)
             addresses.append(addr)
         return addresses
+
+    def compute_addresses_batch(self, hidden_states: torch.Tensor):
+        """
+        Vectorized address computation for a batch.
+        hidden_states : (B, d_model)
+        Returns list of 3 int8 tensors each of shape (B, addr_dim).
+        """
+        addresses = []
+        for head in self.addr_heads:
+            raw = head(hidden_states)                   # (B, addr_dim)
+            scale = raw.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
+            addr = (raw / scale * 127.0).round().clamp(-128, 127).to(torch.int8)
+            addresses.append(addr)
+        return addresses

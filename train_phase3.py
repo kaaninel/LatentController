@@ -61,6 +61,30 @@ def addr_bytes(addr_tensor: torch.Tensor) -> bytes:
     return addr_tensor.cpu().numpy().tobytes()
 
 
+def batch_read_memory(model, hidden_states, memory, cfg, device):
+    """
+    Vectorized memory read for a batch.
+    hidden_states: (B, d_model) tensor — last hidden position per sample.
+    Returns: (B, n_mem_slots, d_model) float tensor on device.
+    """
+    B = hidden_states.size(0)
+    # Batch address computation — 3 heads, each (B, addr_dim) on GPU
+    addr_heads = model.compute_addresses_batch(hidden_states)
+    # Transfer to CPU once, convert to bytes
+    addr_cpu = [h.cpu().numpy() for h in addr_heads]  # 3 × (B, addr_dim)
+    batch_addresses = []
+    for b in range(B):
+        sample_addrs = [addr_cpu[h][b].tobytes() for h in range(len(addr_heads))]
+        batch_addresses.append(sample_addrs)
+    # Batch read: returns (B, n_mem_slots, 512) int8 numpy
+    mem_np = memory.read_memory_batch(batch_addresses)
+    # Convert to float tensor on device in one shot
+    mem_tensor = torch.from_numpy(
+        mem_np.astype(np.float32) / 127.0
+    ).to(device, non_blocking=True)  # (B, n_mem_slots, d_model)
+    return mem_tensor
+
+
 # ---------------------------------------------------------------------------
 # Evaluation with and without memory
 # ---------------------------------------------------------------------------
@@ -95,16 +119,10 @@ def evaluate_with_memory(
         )
         total_loss_no_mem += loss_nm.item()
 
-        # --- with memory (per-sample lookup) ---
+        # --- with memory (batch lookup) ---
         _, _, hid = model(inp, return_hidden=True)
-        mem_list = []
-        for b_idx in range(inp.size(0)):
-            h = hid[b_idx, -1, :]  # (d_model,)
-            addrs = model.compute_addresses(h)
-            addr_bs = [addr_bytes(a) for a in addrs]
-            mem_vecs = eval_memory.read_memory(addr_bs)
-            mem_list.append(memory_vecs_to_tensor(mem_vecs, cfg.d_model, device))
-        mem_tensor = torch.cat(mem_list, dim=0)  # (B, n_mem, d_model)
+        h_last = hid[:, -1, :]  # (B, d_model)
+        mem_tensor = batch_read_memory(model, h_last, eval_memory, cfg, device)
 
         logits_m, _ = model(inp, memory_vectors=mem_tensor)
         loss_m = F.cross_entropy(
@@ -205,11 +223,13 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
         train_ds, batch_size=micro_batch, shuffle=True,
         num_workers=num_workers, pin_memory=pin_memory,
         drop_last=True, persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_ds, batch_size=micro_batch, shuffle=False,
         num_workers=num_workers, pin_memory=pin_memory,
         persistent_workers=num_workers > 0,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
 
     # Memory systems
@@ -282,24 +302,16 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
                 tgt = tgt.to(device, non_blocking=True)
 
                 try:
-                    # Read memory per sample (each sample gets its own memory vectors)
+                    # Batch memory read: one forward pass for addresses, vectorized lookup
                     with torch.no_grad():
                         _, _, hid_nm = model(inp, return_hidden=True)
-                        mem_list = []
-                        for b in range(inp.size(0)):
-                            h_b = hid_nm[b, -1, :]
-                            addrs_b = model.compute_addresses(h_b)
-                            addr_bs_b = [addr_bytes(a) for a in addrs_b]
-                            mem_vecs_b = train_memory.read_memory(addr_bs_b)
-                            mem_list.append(
-                                memory_vecs_to_tensor(mem_vecs_b, cfg.d_model, device)
-                            )
-                        mem_tensor = torch.cat(mem_list, dim=0)  # (B, n_mem, d_model)
+                        h_last = hid_nm[:, -1, :]  # (B, d_model)
+                        mem_tensor = batch_read_memory(
+                            model, h_last, train_memory, cfg, device)
 
                     with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                         logits, _, hidden = model(inp, memory_vectors=mem_tensor, return_hidden=True)
 
-                        # LM loss on text positions only (memory positions excluded)
                         loss = F.cross_entropy(
                             logits.reshape(-1, logits.size(-1)),
                             tgt.reshape(-1),
@@ -318,7 +330,8 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
                         train_loader = DataLoader(
                             train_ds, batch_size=micro_batch, shuffle=True,
                             num_workers=num_workers, pin_memory=pin_memory,
-                            drop_last=True, persistent_workers=num_workers > 0)
+                            drop_last=True, persistent_workers=num_workers > 0,
+                            prefetch_factor=4 if num_workers > 0 else None)
                         loader_iter = iter(train_loader)
                         tokens_per_step = micro_batch * grad_accum * cfg.max_seq_len
                         total_steps = pcfg.total_tokens // tokens_per_step
@@ -333,20 +346,19 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
             optimizer.zero_grad(set_to_none=True)
             step += 1
 
-            # Write to memory every N steps
+            # Write to memory every N steps (batch vectorized)
             if step % pcfg.write_every_n_steps == 0:
                 with torch.no_grad():
-                    # Use a position from the middle of the text sequence as a
-                    # representative hidden state (avoids edge effects at BOS/EOS).
                     text_start = cfg.n_mem_positions
                     text_len = hidden.shape[1] - text_start
                     mid_text_pos = text_start + text_len // 2
+                    h_mid = hidden[:, mid_text_pos, :]  # (B, d_model)
+                    vecs_np = h_mid.detach().float().cpu().numpy()  # (B, d_model)
+                    addr_heads = model.compute_addresses_batch(h_mid.detach())
+                    addr_cpu = [h.cpu().numpy() for h in addr_heads]
                     for b in range(hidden.shape[0]):
-                        h = hidden[b, mid_text_pos, :]
-                        vec_np = h.detach().float().cpu().numpy()
-                        addrs_b = model.compute_addresses(h.detach())
-                        addr_bs_b = [addr_bytes(a) for a in addrs_b]
-                        train_memory.write_memory(addr_bs_b, vec_np)
+                        addrs_b = [addr_cpu[h][b].tobytes() for h in range(len(addr_heads))]
+                        train_memory.write_memory(addrs_b, vecs_np[b])
 
             if step % 500 == 0:
                 elapsed = timer.elapsed()
@@ -364,6 +376,7 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
             if step % pcfg.eval_interval == 0:
                 # Refresh eval memory snapshot
                 if step % pcfg.eval_memory_refresh_interval == 0:
+                    train_memory.flush_to_disk()
                     shutil.rmtree(eval_mem_dir, ignore_errors=True)
                     shutil.copytree(train_mem_dir, eval_mem_dir)
                     eval_memory = MemorySystem(eval_mem_dir, mcfg)
@@ -388,6 +401,7 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
                 model.train()
 
             if step % pcfg.save_interval == 0:
+                train_memory.flush_to_disk()
                 save_checkpoint(
                     model, optimizer, step, accum_loss,
                     os.path.join(phase3_dir, "latest.pt"),
@@ -400,6 +414,7 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
 
     except KeyboardInterrupt:
         print("\nInterrupted — saving…")
+        train_memory.flush_to_disk()
         save_checkpoint(
             model, optimizer, step, accum_loss,
             os.path.join(phase3_dir, "latest.pt"),
@@ -410,6 +425,7 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
             },
         )
 
+    train_memory.flush_to_disk()
     wall_time = timer.elapsed()
     print("=" * 64)
     print("  PHASE 3 COMPLETE")

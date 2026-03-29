@@ -36,7 +36,7 @@ from utils import (
     get_lr, save_checkpoint, load_checkpoint,
     Timer, vram_report, peak_vram, format_eta, format_time,
 )
-from train_phase3 import memory_vecs_to_tensor, addr_bytes, hidden_to_int8
+from train_phase3 import memory_vecs_to_tensor, addr_bytes, hidden_to_int8, batch_read_memory
 from train_phase4 import get_curriculum
 
 
@@ -96,14 +96,9 @@ def streaming_act_forward(
 
         # Re-read memory for next ACT step (addresses shift as hidden evolves)
         if i < max_steps - 1 and memory_system is not None:
-            mem_list = []
-            for b in range(B):
-                h_b = hidden[b, -1, :].detach()
-                addrs = model.compute_addresses(h_b)
-                ab = [addr_bytes(a) for a in addrs]
-                vecs = memory_system.read_memory(ab)
-                mem_list.append(memory_vecs_to_tensor(vecs, cfg.d_model, device))
-            mem_tensor = torch.cat(mem_list, dim=0)
+            h_last = hidden[:, -1, :].detach()  # (B, d_model)
+            mem_tensor = batch_read_memory(
+                model, h_last, memory_system, cfg, device)
 
     return weighted_logits, expected_steps, halt_step_counts, final_hidden
 
@@ -126,25 +121,22 @@ def write_memory_multi_position(
     if text_len <= 0:
         return 0
 
-    n_writes = 0
-    for pos in range(text_start + write_every, T, write_every):
-        for b in range(B):
-            h = hidden[b, pos, :].detach()
-            vec_np = h.float().cpu().numpy()
-            addrs = model.compute_addresses(h)
-            ab = [addr_bytes(a) for a in addrs]
-            memory_system.write_memory(ab, vec_np)
-            n_writes += 1
-
-    # Always write the last text position (most complete hidden state)
+    # Collect all write positions
+    positions = list(range(text_start + write_every, T, write_every))
     last_pos = T - 1
-    for b in range(B):
-        h = hidden[b, last_pos, :].detach()
-        vec_np = h.float().cpu().numpy()
-        addrs = model.compute_addresses(h)
-        ab = [addr_bytes(a) for a in addrs]
-        memory_system.write_memory(ab, vec_np)
-        n_writes += 1
+    if not positions or positions[-1] != last_pos:
+        positions.append(last_pos)
+
+    n_writes = 0
+    for pos in positions:
+        h_batch = hidden[:, pos, :].detach()  # (B, d_model)
+        vecs_np = h_batch.float().cpu().numpy()  # (B, d_model)
+        addr_heads = model.compute_addresses_batch(h_batch)
+        addr_cpu = [h.cpu().numpy() for h in addr_heads]
+        for b in range(B):
+            ab = [addr_cpu[h][b].tobytes() for h in range(len(addr_heads))]
+            memory_system.write_memory(ab, vecs_np[b])
+            n_writes += 1
 
     return n_writes
 
@@ -173,18 +165,12 @@ def evaluate_streaming(
             break
         inp, tgt = inp.to(device), tgt.to(device)
 
-        # Read memory per sample
+        # Read memory (batch vectorized)
         mem_tensor = None
         if eval_memory is not None:
             _, _, hid = model(inp, return_hidden=True)
-            mem_list = []
-            for b in range(inp.size(0)):
-                h_b = hid[b, -1, :]
-                addrs = model.compute_addresses(h_b)
-                ab = [addr_bytes(a) for a in addrs]
-                vecs = eval_memory.read_memory(ab)
-                mem_list.append(memory_vecs_to_tensor(vecs, cfg.d_model, device))
-            mem_tensor = torch.cat(mem_list, dim=0)
+            h_last = hid[:, -1, :]  # (B, d_model)
+            mem_tensor = batch_read_memory(model, h_last, eval_memory, cfg, device)
 
         # Streaming ACT forward
         weighted_logits, _, _, _ = streaming_act_forward(
@@ -422,20 +408,13 @@ def train(
                 tgt = tgt.to(device, non_blocking=True)
 
                 try:
-                    # Initial memory read (per-sample)
+                    # Initial memory read (batch vectorized)
                     mem_tensor = None
                     with torch.no_grad():
                         _, _, hid_init = model(inp, return_hidden=True)
-                        mem_list = []
-                        for b in range(inp.size(0)):
-                            h_b = hid_init[b, -1, :]
-                            addrs = model.compute_addresses(h_b)
-                            ab = [addr_bytes(a) for a in addrs]
-                            vecs = train_memory.read_memory(ab)
-                            mem_list.append(
-                                memory_vecs_to_tensor(vecs, cfg.d_model, device)
-                            )
-                        mem_tensor = torch.cat(mem_list, dim=0)
+                        h_last = hid_init[:, -1, :]  # (B, d_model)
+                        mem_tensor = batch_read_memory(
+                            model, h_last, train_memory, cfg, device)
 
                     # Streaming ACT forward (re-reads memory between steps)
                     with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
@@ -552,6 +531,7 @@ def train(
 
             # Save checkpoint
             if step % pcfg.save_interval == 0:
+                train_memory.flush_to_disk()
                 save_checkpoint(
                     model, optimizer, step, accum_loss,
                     os.path.join(phase5_dir, "latest.pt"),
@@ -565,6 +545,7 @@ def train(
 
     except KeyboardInterrupt:
         print("\nInterrupted — saving…")
+        train_memory.flush_to_disk()
         save_checkpoint(
             model, optimizer, step, accum_loss,
             os.path.join(phase5_dir, "latest.pt"),
@@ -576,6 +557,7 @@ def train(
             },
         )
 
+    train_memory.flush_to_disk()
     wall_time = timer.elapsed()
     print("=" * 64)
     print("  PHASE 5 COMPLETE")

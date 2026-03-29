@@ -124,9 +124,56 @@ class MemorySystem:
         # Count of stored records
         self._n_records = self._count_records()
 
-        # Rebuild trie indexes from disk is not done here to keep startup fast.
-        # Callers should call rebuild_indexes() after loading a checkpoint if
-        # they need consistent lookup from a previous session.
+        # RAM cache: load all records into memory to eliminate disk I/O
+        self._data_cache: Optional[np.ndarray] = None
+        self._meta_cache: Optional[np.ndarray] = None
+        self._cache_capacity = 0
+        self._load_cache()
+
+    def _load_cache(self):
+        """Load all records and metadata into RAM."""
+        if self._n_records > 0 and os.path.exists(self._data_file):
+            raw = np.fromfile(self._data_file, dtype=np.int8)
+            self._data_cache = raw.reshape(-1, RECORD_SIZE)
+        else:
+            self._data_cache = np.empty((0, RECORD_SIZE), dtype=np.int8)
+
+        if self._n_records > 0 and os.path.exists(self._meta_file):
+            raw_meta = np.fromfile(self._meta_file, dtype=np.uint16)
+            self._meta_cache = raw_meta
+        else:
+            self._meta_cache = np.empty(0, dtype=np.uint16)
+
+        self._cache_capacity = max(self._n_records, 1024)
+        # Pre-allocate with headroom to avoid frequent resizes
+        if self._data_cache.shape[0] < self._cache_capacity:
+            new_data = np.zeros((self._cache_capacity, RECORD_SIZE), dtype=np.int8)
+            new_data[:self._data_cache.shape[0]] = self._data_cache
+            self._data_cache = new_data
+        if self._meta_cache.shape[0] < self._cache_capacity:
+            new_meta = np.zeros(self._cache_capacity, dtype=np.uint16)
+            new_meta[:self._meta_cache.shape[0]] = self._meta_cache
+            self._meta_cache = new_meta
+
+    def _ensure_capacity(self, needed: int):
+        """Grow cache arrays if needed."""
+        if needed <= self._cache_capacity:
+            return
+        new_cap = max(needed, self._cache_capacity * 2)
+        new_data = np.zeros((new_cap, RECORD_SIZE), dtype=np.int8)
+        new_data[:self._n_records] = self._data_cache[:self._n_records]
+        self._data_cache = new_data
+        new_meta = np.zeros(new_cap, dtype=np.uint16)
+        new_meta[:self._n_records] = self._meta_cache[:self._n_records]
+        self._meta_cache = new_meta
+        self._cache_capacity = new_cap
+
+    def flush_to_disk(self):
+        """Write RAM cache to disk. Call periodically or at checkpoints."""
+        with self._lock:
+            if self._n_records > 0:
+                self._data_cache[:self._n_records].tofile(self._data_file)
+                self._meta_cache[:self._n_records].tofile(self._meta_file)
 
     # ------------------------------------------------------------------
     # Disk helpers
@@ -139,46 +186,28 @@ class MemorySystem:
         return size // RECORD_SIZE
 
     def _read_record(self, record_number: int) -> np.ndarray:
-        offset = record_number * RECORD_SIZE
-        with open(self._data_file, "rb") as f:
-            f.seek(offset)
-            data = f.read(RECORD_SIZE)
-        return np.frombuffer(data, dtype=np.int8).copy()
+        return self._data_cache[record_number].copy()
 
     def _write_record(self, record_number: int, vec: np.ndarray):
-        offset = record_number * RECORD_SIZE
-        with open(self._data_file, "r+b") as f:
-            f.seek(offset)
-            f.write(vec.astype(np.int8).tobytes())
+        self._data_cache[record_number] = vec.astype(np.int8)
 
     def _append_record(self, vec: np.ndarray) -> int:
-        """Append a new record, return its record number."""
+        """Append a new record to RAM cache, return its record number."""
         with self._lock:
             rec_num = self._n_records
-            with open(self._data_file, "ab") as f:
-                f.write(vec.astype(np.int8).tobytes())
-            # Append write_count = 1 to meta
-            with open(self._meta_file, "ab") as f:
-                f.write(struct.pack("<H", 1))
+            self._ensure_capacity(rec_num + 1)
+            self._data_cache[rec_num] = vec.astype(np.int8)
+            self._meta_cache[rec_num] = 1
             self._n_records += 1
         return rec_num
 
     def _read_write_count(self, record_number: int) -> int:
-        offset = record_number * 2
-        if not os.path.exists(self._meta_file):
+        if record_number >= self._n_records:
             return 0
-        with open(self._meta_file, "rb") as f:
-            f.seek(offset)
-            data = f.read(2)
-        if len(data) < 2:
-            return 0
-        return struct.unpack("<H", data)[0]
+        return int(self._meta_cache[record_number])
 
     def _write_write_count(self, record_number: int, count: int):
-        offset = record_number * 2
-        with open(self._meta_file, "r+b") as f:
-            f.seek(offset)
-            f.write(struct.pack("<H", min(count, self.cfg.max_write_count)))
+        self._meta_cache[record_number] = min(count, self.cfg.max_write_count)
 
     # ------------------------------------------------------------------
     # Read memory
@@ -267,3 +296,39 @@ class MemorySystem:
             self._write_write_count(rec_num, new_count)
             for head_idx, addr in enumerate(addresses):
                 self.indexes[head_idx].insert(addr, rec_num, new_count)
+
+    def read_memory_batch(
+        self, batch_addresses: List[List[bytes]]
+    ) -> np.ndarray:
+        """
+        Vectorized batch memory read.
+
+        batch_addresses: List of B items, each a list of 3 byte-strings.
+        Returns: np.ndarray of shape (B, n_mem_slots, RECORD_SIZE), dtype int8.
+        """
+        B = len(batch_addresses)
+        n_slots = self.cfg.n_mem_slots
+        result = np.zeros((B, n_slots, RECORD_SIZE), dtype=np.int8)
+
+        for b in range(B):
+            seen = set()
+            slot = 0
+            for head_idx, addr in enumerate(batch_addresses[b]):
+                idx = self.indexes[head_idx]
+                node = idx.lookup(addr)
+                if node is not None and node.record_number not in seen:
+                    seen.add(node.record_number)
+                    if slot < n_slots:
+                        result[b, slot] = self._data_cache[node.record_number]
+                        slot += 1
+
+                for _, rec_num, _ in idx.find_nearest(
+                    addr, k=self.cfg.neighbor_k,
+                    coarse_dims=self.cfg.coarse_dims,
+                ):
+                    if rec_num not in seen and slot < n_slots:
+                        seen.add(rec_num)
+                        result[b, slot] = self._data_cache[rec_num]
+                        slot += 1
+
+        return result
