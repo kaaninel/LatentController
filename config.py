@@ -37,8 +37,8 @@ class Phase1Config:
     grad_accum: int = 8
     total_tokens: int = 1_500_000_000
     max_grad_norm: float = 1.0
-    eval_interval: int = 5000
-    save_interval: int = 10000
+    eval_interval: int = 1000
+    save_interval: int = 2000
     log_interval: int = 100
 
 
@@ -68,10 +68,10 @@ class Phase3Config:
     grad_accum: int = 8
     total_tokens: int = 2_000_000_000
     max_grad_norm: float = 1.0
-    eval_interval: int = 5000
-    save_interval: int = 10000
+    eval_interval: int = 1000
+    save_interval: int = 2000
     write_every_n_steps: int = 5
-    eval_memory_refresh_interval: int = 20000
+    eval_memory_refresh_interval: int = 4000
 
 
 @dataclass
@@ -85,8 +85,8 @@ class Phase4Config:
     grad_accum: int = 16
     total_tokens: int = 1_000_000_000
     max_grad_norm: float = 1.0
-    eval_interval: int = 5000
-    save_interval: int = 10000
+    eval_interval: int = 1000
+    save_interval: int = 2000
     ponder_curriculum: list = field(default_factory=lambda: [
         (0,      2, 0.0,    1.0),
         (10000,  4, 0.0,    1.0),
