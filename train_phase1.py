@@ -14,7 +14,10 @@ from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 
 from config import ModelConfig, Phase1Config
-from hardware import detect_hardware, print_hardware_report
+from hardware import (
+    detect_hardware, print_hardware_report,
+    auto_calibrate_batch_size, build_trial_fn, handle_oom,
+)
 from model import LoopedLatentController
 from dataset import prepare_data, train_tokenizer_from_tinystories
 from utils import (
@@ -53,17 +56,6 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
 
     train_ds, val_ds, tokenizer = prepare_data(tok_path, data_dir, seq_len=cfg.max_seq_len)
 
-    train_loader = DataLoader(
-        train_ds, batch_size=micro_batch, shuffle=True,
-        num_workers=num_workers, pin_memory=pin_memory,
-        drop_last=True, persistent_workers=num_workers > 0,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=micro_batch, shuffle=False,
-        num_workers=num_workers, pin_memory=pin_memory,
-        persistent_workers=num_workers > 0,
-    )
-
     # ---------------------------------------------------------------- model
     model = LoopedLatentController(cfg, use_checkpoint=use_ckpt).to(device)
     total_params   = sum(p.numel() for p in model.parameters())
@@ -75,6 +67,28 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
             model = torch.compile(model, mode='reduce-overhead')
         except Exception as e:
             print(f"torch.compile failed ({e}), continuing without compilation.")
+
+    # ------------------------------------------------ auto-calibrate batch size
+    target_effective = micro_batch * grad_accum
+    if device == 'cuda':
+        trial = build_trial_fn(model, cfg, device, use_amp, amp_dtype,
+                               has_memory=False, act_steps=1)
+        micro_batch, grad_accum = auto_calibrate_batch_size(
+            trial, device, micro_batch,
+            target_effective=target_effective,
+            target_vram_frac=0.90,
+        )
+
+    train_loader = DataLoader(
+        train_ds, batch_size=micro_batch, shuffle=True,
+        num_workers=num_workers, pin_memory=pin_memory,
+        drop_last=True, persistent_workers=num_workers > 0,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=micro_batch, shuffle=False,
+        num_workers=num_workers, pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -146,18 +160,34 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
                 inp = inp.to(device, non_blocking=True)
                 tgt = tgt.to(device, non_blocking=True)
 
-                with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-                    logits, _ = model(inp)
-                    loss = F.cross_entropy(
-                        logits.reshape(-1, logits.size(-1)),
-                        tgt.reshape(-1),
-                        ignore_index=cfg.pad_id,
-                    )
-                    loss = loss / grad_accum
+                try:
+                    with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+                        logits, _ = model(inp)
+                        loss = F.cross_entropy(
+                            logits.reshape(-1, logits.size(-1)),
+                            tgt.reshape(-1),
+                            ignore_index=cfg.pad_id,
+                        )
+                        loss = loss / grad_accum
 
-                scaler.scale(loss).backward()
-                accum_loss += loss.item()
-                tokens_seen += inp.numel()
+                    scaler.scale(loss).backward()
+                    accum_loss += loss.item()
+                    tokens_seen += inp.numel()
+
+                except torch.cuda.OutOfMemoryError:
+                    micro_batch, grad_accum, rebuild = handle_oom(
+                        micro_batch, grad_accum, target_effective)
+                    if rebuild:
+                        train_loader = DataLoader(
+                            train_ds, batch_size=micro_batch, shuffle=True,
+                            num_workers=num_workers, pin_memory=pin_memory,
+                            drop_last=True, persistent_workers=num_workers > 0)
+                        loader_iter = iter(train_loader)
+                        tokens_per_step = micro_batch * grad_accum * cfg.max_seq_len
+                        total_steps = pcfg.total_tokens // tokens_per_step
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_loss = 0.0
+                    break  # restart this optimizer step
 
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), pcfg.max_grad_norm)

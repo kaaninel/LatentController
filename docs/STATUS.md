@@ -16,13 +16,14 @@
 - ✅ **Configurable datasets** — `dataset.py` accepts any HuggingFace dataset with column mapping
 - ✅ **NOOP target generation** — Data-driven NOOP targets from context/response structure
 - ✅ **Phase 5 implemented** — Unified streaming training with all systems active
+- ✅ **Dynamic VRAM calibration** — Binary search finds max batch size at startup (~90% utilization)
+- ✅ **OOM safety** — Runtime recovery: halves micro_batch, doubles grad_accum, rebuilds DataLoader
 
 ### What's Broken
 - (All previously identified critical bugs are fixed)
 
 ### What's Missing
 - ❌ HuggingFace streaming dataset mode (full dataset loaded to RAM)
-- ❌ OOM safety (auto batch-size reduction)
 - ❌ True token-by-token streaming training (Phase 5 uses full-sequence causal as approximation)
 - ❌ Distributed training (DDP/FSDP)
 - ❌ **Phases 2-5 not yet trained** — Code ready, needs Colab A100 execution
@@ -115,7 +116,6 @@ Phase 5 is implemented in `train_phase5.py` with:
 ### Short-term (Dataset & Config)
 6. **Configurable dataset**: Remove TinyStories hardcoding
 7. **Streaming dataset**: HuggingFace streaming mode
-8. **VRAM safety**: Auto-reduce batch size on OOM
 
 ### Medium-term (Quality)
 9. **Hard ACT training**: Anneal soft→hard halting

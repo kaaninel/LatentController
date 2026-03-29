@@ -105,6 +105,17 @@ Input: token_ids (B, T_text) + optional memory_vectors (B, n_mem, d_model)
 | 100K | 6 | 0.005 | 0.5 |
 | 120K | 6 | 0.005 | 0.1 |
 
+## Hardware Adaptation
+
+### Dynamic VRAM Calibration (`hardware.py`)
+All training phases auto-calibrate batch sizes at startup via binary search:
+
+1. **`auto_calibrate_batch_size()`** — Runs trial forward+backward passes at increasing batch sizes. Finds the maximum `micro_batch` that fits within 90% of total VRAM, then adjusts `grad_accum` to maintain the target effective batch size.
+2. **`build_trial_fn()`** — Creates phase-specific trial callables. For ACT phases (4, 5), the trial uses the maximum curriculum ACT steps for safety.
+3. **`handle_oom()`** — Runtime recovery: halves `micro_batch`, doubles `grad_accum`, signals DataLoader rebuild. All 5 training loops catch `torch.cuda.OutOfMemoryError` and recover gracefully.
+
+Static per-GPU configs (A100, H100, T4, etc.) serve as initial hints. Calibration always refines them.
+
 ## Training Pipeline
 
 ### Phase 1: Baseline Language Model

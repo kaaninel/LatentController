@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from config import ModelConfig, Phase2Config
-from hardware import detect_hardware, print_hardware_report
+from hardware import detect_hardware, print_hardware_report, handle_oom
 from model import LoopedLatentController
 from dataset import prepare_data
 from utils import load_checkpoint, save_checkpoint, Timer, vram_report, peak_vram, format_eta, format_time
@@ -183,6 +183,30 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
     hiddens_norm = F.normalize(hiddens.float(), dim=-1)  # (N, d_model) on CPU
     hiddens = hiddens.to(device)
 
+    # Auto-calibrate batch_size for contrastive training
+    if device == 'cuda':
+        from hardware import auto_calibrate_batch_size
+
+        def _trial_p2(bs):
+            idx_t = torch.randperm(N, device=device)[:bs]
+            b = hiddens[idx_t]
+            bn = hiddens_norm[idx_t.cpu()].to(device)
+            sim = torch.mm(bn, bn.T)
+            loss = contrastive_loss(
+                model.addr_heads, b, sim,
+                pcfg.pos_threshold, pcfg.neg_threshold, pcfg.margin,
+                pcfg.entropy_weight, pcfg.target_dim_std, device,
+            )
+            loss.backward()
+            model.zero_grad(set_to_none=True)
+
+        batch_size, _ = auto_calibrate_batch_size(
+            _trial_p2, device, batch_size,
+            target_effective=batch_size,  # no grad_accum in P2
+            target_vram_frac=0.90,
+        )
+        print(f"  Phase 2 calibrated batch_size: {batch_size}")
+
     # Training loop
     N = hiddens.shape[0]
     model.train()
@@ -205,21 +229,28 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
         batch_norm = hiddens_norm[idx.cpu()].to(device)  # (B, d_model)
         sim_batch = torch.mm(batch_norm, batch_norm.T)   # (B, B) — fits in VRAM
 
-        loss = contrastive_loss(
-            model.addr_heads,
-            batch,
-            sim_batch,
-            pcfg.pos_threshold,
-            pcfg.neg_threshold,
-            pcfg.margin,
-            pcfg.entropy_weight,
-            pcfg.target_dim_std,
-            device,
-        )
+        try:
+            loss = contrastive_loss(
+                model.addr_heads,
+                batch,
+                sim_batch,
+                pcfg.pos_threshold,
+                pcfg.neg_threshold,
+                pcfg.margin,
+                pcfg.entropy_weight,
+                pcfg.target_dim_std,
+                device,
+            )
 
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            batch_size = max(256, batch_size // 2)
+            print(f"  ⚠ OOM! Reduced batch_size to {batch_size}")
+            optimizer.zero_grad(set_to_none=True)
+            continue
 
         if step % 100 == 0:
             elapsed = timer.elapsed()

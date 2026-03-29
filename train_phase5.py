@@ -25,7 +25,10 @@ from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 
 from config import ModelConfig, Phase5Config, MemoryConfig
-from hardware import detect_hardware, print_hardware_report
+from hardware import (
+    detect_hardware, print_hardware_report,
+    auto_calibrate_batch_size, build_trial_fn, handle_oom,
+)
 from model import LoopedLatentController
 from memory import MemorySystem
 from dataset import prepare_data
@@ -252,17 +255,6 @@ def train(
         context_column=context_column,
     )
 
-    train_loader = DataLoader(
-        train_ds, batch_size=micro_batch, shuffle=True,
-        num_workers=num_workers, pin_memory=pin_memory,
-        drop_last=True, persistent_workers=num_workers > 0,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=micro_batch, shuffle=False,
-        num_workers=num_workers, pin_memory=pin_memory,
-        persistent_workers=num_workers > 0,
-    )
-
     # ---------------------------------------------------------------- model
     model = LoopedLatentController(cfg, use_checkpoint=use_ckpt).to(device)
 
@@ -295,6 +287,29 @@ def train(
     for head in model.addr_heads:
         for p in head.parameters():
             p.requires_grad_(True)  # UNFROZEN — will train at 0.3× LR
+
+    # ------------------------------------------------ auto-calibrate batch size
+    max_curriculum_steps = max(s[1] for s in pcfg.ponder_curriculum)
+    target_effective = micro_batch * grad_accum
+    if device == 'cuda':
+        trial = build_trial_fn(model, cfg, device, use_amp, amp_dtype,
+                               has_memory=True, act_steps=max_curriculum_steps)
+        micro_batch, grad_accum = auto_calibrate_batch_size(
+            trial, device, micro_batch,
+            target_effective=target_effective,
+            target_vram_frac=0.90,
+        )
+
+    train_loader = DataLoader(
+        train_ds, batch_size=micro_batch, shuffle=True,
+        num_workers=num_workers, pin_memory=pin_memory,
+        drop_last=True, persistent_workers=num_workers > 0,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=micro_batch, shuffle=False,
+        num_workers=num_workers, pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+    )
 
     # ----------------------------------------------------------- memory
     # Bootstrap from Phase 3 memory if available, else start fresh
@@ -406,59 +421,75 @@ def train(
                 inp = inp.to(device, non_blocking=True)
                 tgt = tgt.to(device, non_blocking=True)
 
-                # Initial memory read (per-sample)
-                mem_tensor = None
-                with torch.no_grad():
-                    _, _, hid_init = model(inp, return_hidden=True)
-                    mem_list = []
-                    for b in range(inp.size(0)):
-                        h_b = hid_init[b, -1, :]
-                        addrs = model.compute_addresses(h_b)
-                        ab = [addr_bytes(a) for a in addrs]
-                        vecs = train_memory.read_memory(ab)
-                        mem_list.append(
-                            memory_vecs_to_tensor(vecs, cfg.d_model, device)
-                        )
-                    mem_tensor = torch.cat(mem_list, dim=0)
-
-                # Streaming ACT forward (re-reads memory between steps)
-                with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-                    if pcfg.streaming_act:
-                        weighted_logits, expected_steps, counts, hidden = streaming_act_forward(
-                            model, inp, train_memory, mem_tensor,
-                            max_act, temperature, cfg,
-                        )
-                    else:
-                        # Fallback: standard ACT without memory re-reads
-                        weighted_logits, expected_steps, counts, hidden = streaming_act_forward(
-                            model, inp, None, mem_tensor,
-                            max_act, temperature, cfg,
-                        )
-                    halt_hist.update(counts)
-
-                    lm_loss = F.cross_entropy(
-                        weighted_logits.reshape(-1, weighted_logits.size(-1)),
-                        tgt.reshape(-1),
-                        ignore_index=cfg.pad_id,
-                    )
-                    ponder_loss = (
-                        ponder_w * expected_steps.mean()
-                        if ponder_w > 0 else torch.zeros_like(lm_loss)
-                    )
-                    loss = (lm_loss + ponder_loss) / grad_accum
-
-                scaler.scale(loss).backward()
-                accum_loss += loss.item()
-                tokens_seen += inp.numel()
-
-                # Memory writes at multiple positions
-                if hidden is not None:
+                try:
+                    # Initial memory read (per-sample)
+                    mem_tensor = None
                     with torch.no_grad():
-                        n_writes = write_memory_multi_position(
-                            model, hidden.detach(), train_memory, cfg,
-                            write_every=pcfg.write_every_n_positions,
+                        _, _, hid_init = model(inp, return_hidden=True)
+                        mem_list = []
+                        for b in range(inp.size(0)):
+                            h_b = hid_init[b, -1, :]
+                            addrs = model.compute_addresses(h_b)
+                            ab = [addr_bytes(a) for a in addrs]
+                            vecs = train_memory.read_memory(ab)
+                            mem_list.append(
+                                memory_vecs_to_tensor(vecs, cfg.d_model, device)
+                            )
+                        mem_tensor = torch.cat(mem_list, dim=0)
+
+                    # Streaming ACT forward (re-reads memory between steps)
+                    with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+                        if pcfg.streaming_act:
+                            weighted_logits, expected_steps, counts, hidden = streaming_act_forward(
+                                model, inp, train_memory, mem_tensor,
+                                max_act, temperature, cfg,
+                            )
+                        else:
+                            weighted_logits, expected_steps, counts, hidden = streaming_act_forward(
+                                model, inp, None, mem_tensor,
+                                max_act, temperature, cfg,
+                            )
+                        halt_hist.update(counts)
+
+                        lm_loss = F.cross_entropy(
+                            weighted_logits.reshape(-1, weighted_logits.size(-1)),
+                            tgt.reshape(-1),
+                            ignore_index=cfg.pad_id,
                         )
-                        total_mem_writes += n_writes
+                        ponder_loss = (
+                            ponder_w * expected_steps.mean()
+                            if ponder_w > 0 else torch.zeros_like(lm_loss)
+                        )
+                        loss = (lm_loss + ponder_loss) / grad_accum
+
+                    scaler.scale(loss).backward()
+                    accum_loss += loss.item()
+                    tokens_seen += inp.numel()
+
+                    # Memory writes at multiple positions
+                    if hidden is not None:
+                        with torch.no_grad():
+                            n_writes = write_memory_multi_position(
+                                model, hidden.detach(), train_memory, cfg,
+                                write_every=pcfg.write_every_n_positions,
+                            )
+                            total_mem_writes += n_writes
+
+                except torch.cuda.OutOfMemoryError:
+                    micro_batch, grad_accum, rebuild = handle_oom(
+                        micro_batch, grad_accum, target_effective)
+                    if rebuild:
+                        train_loader = DataLoader(
+                            train_ds, batch_size=micro_batch, shuffle=True,
+                            num_workers=num_workers, pin_memory=pin_memory,
+                            drop_last=True, persistent_workers=num_workers > 0)
+                        loader_iter = iter(train_loader)
+                        tokens_per_step = micro_batch * grad_accum * cfg.max_seq_len
+                        total_steps = pcfg.total_tokens // tokens_per_step
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_loss = 0.0
+                    halt_hist.clear()
+                    break
 
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), pcfg.max_grad_norm)

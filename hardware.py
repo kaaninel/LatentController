@@ -2,16 +2,168 @@
 GPU Detection and Auto-Configuration.
 
 Detects the available hardware and returns optimal training parameters.
+Includes dynamic VRAM calibration to maximize GPU utilization.
 """
 
 import os
+from typing import Callable, Optional
 
 import torch
+import torch.nn.functional as F
 
 try:
     import psutil as _psutil
 except ImportError:
     _psutil = None
+
+
+# ---------------------------------------------------------------------------
+# Dynamic batch-size calibration
+# ---------------------------------------------------------------------------
+
+def auto_calibrate_batch_size(
+    trial_fn: Callable[[int], None],
+    device: str,
+    initial_bs: int,
+    target_effective: int = 128,
+    target_vram_frac: float = 0.90,
+    min_bs: int = 1,
+    max_bs: int = 2048,
+) -> tuple:
+    """
+    Find the maximum micro_batch that fits in VRAM via binary search.
+
+    Args:
+        trial_fn: Callable(batch_size) that runs one forward+backward pass
+                  with the given batch size. Must raise
+                  torch.cuda.OutOfMemoryError if it doesn't fit.
+        device: 'cuda' or 'cpu'.
+        initial_bs: Starting batch size (hardware override hint).
+        target_effective: Desired effective batch (micro_batch * grad_accum).
+        target_vram_frac: Target VRAM utilisation (0.0-1.0).
+        min_bs: Floor for micro_batch.
+        max_bs: Ceiling for micro_batch.
+
+    Returns:
+        (micro_batch, grad_accum)
+    """
+    if device != 'cuda':
+        ga = max(1, target_effective // initial_bs)
+        return initial_bs, ga
+
+    total_vram = torch.cuda.get_device_properties(0).total_memory
+    target_bytes = int(total_vram * target_vram_frac)
+
+    print(f"  ⚡ Auto-calibrating batch size "
+          f"(target: {target_vram_frac*100:.0f}% of {total_vram/1e9:.1f} GB = "
+          f"{target_bytes/1e9:.1f} GB)…")
+
+    def _fits(bs: int) -> bool:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        try:
+            trial_fn(bs)
+            peak = torch.cuda.max_memory_allocated()
+            torch.cuda.empty_cache()
+            return peak <= target_bytes
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            return False
+
+    # Quick first probe with the initial (static) hint
+    if not _fits(initial_bs):
+        # Static config is already too big — search [min_bs, initial_bs)
+        lo, hi = min_bs, initial_bs - 1
+    else:
+        # Room to grow — find upper bound by doubling
+        lo = initial_bs
+        hi = initial_bs
+        while hi < max_bs:
+            nxt = min(hi * 2, max_bs)
+            if _fits(nxt):
+                hi = nxt
+                if hi == max_bs:
+                    break
+            else:
+                hi = nxt
+                break
+        # hi is either the first that didn't fit, or max_bs that fit
+
+    # Binary search for the largest bs that fits
+    best = min_bs
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if _fits(mid):
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    micro_batch = max(min_bs, best)
+    grad_accum = max(1, target_effective // micro_batch)
+    eff = micro_batch * grad_accum
+
+    print(f"  ✓ Calibrated: micro_batch={micro_batch}, "
+          f"grad_accum={grad_accum} (effective={eff})")
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    return micro_batch, grad_accum
+
+
+def build_trial_fn(model, cfg, device, use_amp, amp_dtype,
+                   has_memory=False, act_steps=1):
+    """
+    Build a trial function for batch-size calibration.
+
+    The returned callable runs one forward+backward pass that mirrors
+    the real training step (including memory prepend and ACT iterations).
+    """
+    from torch.amp import autocast
+
+    def trial(bs):
+        inp = torch.randint(0, cfg.vocab_size, (bs, cfg.max_seq_len),
+                            device=device)
+
+        mem = None
+        if has_memory:
+            mem = torch.zeros(bs, cfg.n_mem_slots, cfg.d_model,
+                              device=device, dtype=amp_dtype if use_amp
+                              else torch.float32)
+
+        with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+            weighted = None
+            for _ in range(act_steps):
+                logits, halt_logits, hidden = model(
+                    inp, memory_vectors=mem, return_hidden=True)
+                if weighted is None:
+                    weighted = logits
+                else:
+                    weighted = weighted + logits
+
+            loss = F.cross_entropy(
+                weighted.reshape(-1, weighted.size(-1)),
+                inp.reshape(-1),  # dummy target
+                ignore_index=cfg.pad_id,
+            )
+
+        loss.backward()
+        model.zero_grad(set_to_none=True)
+
+    return trial
+
+
+def handle_oom(micro_batch, grad_accum, target_effective, min_bs=1):
+    """
+    Called when an OOM occurs during training.
+    Returns (new_micro_batch, new_grad_accum, needs_loader_rebuild).
+    """
+    torch.cuda.empty_cache()
+    new_mb = max(min_bs, micro_batch // 2)
+    new_ga = max(1, target_effective // new_mb)
+    print(f"  ⚠ OOM! Reducing micro_batch {micro_batch}→{new_mb}, "
+          f"grad_accum {grad_accum}→{new_ga}")
+    return new_mb, new_ga, (new_mb != micro_batch)
 
 
 def detect_hardware():
@@ -274,7 +426,7 @@ def print_hardware_report(info):
     print("-" * 70)
 
     ov = info['overrides']
-    print("  OPTIMAL SETTINGS (auto-detected):")
+    print("  INITIAL SETTINGS (will be refined by auto-calibration):")
     print(f"  AMP:             {'Enabled (' + str(info['amp_dtype']).split('.')[-1] + ')' if ov.get('use_amp') else 'Disabled'}")
     print(f"  torch.compile:   {'Enabled' if ov.get('use_compile') else 'Disabled'}")
     print(f"  Grad Checkpoint: {'Enabled' if ov.get('gradient_checkpointing') else 'Disabled'}")

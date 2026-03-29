@@ -17,7 +17,10 @@ from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 
 from config import ModelConfig, Phase3Config, MemoryConfig
-from hardware import detect_hardware, print_hardware_report
+from hardware import (
+    detect_hardware, print_hardware_report,
+    auto_calibrate_batch_size, build_trial_fn, handle_oom,
+)
 from model import LoopedLatentController
 from memory import MemorySystem
 from dataset import prepare_data
@@ -165,17 +168,6 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
     tok_path = os.path.join(data_dir, "tokenizer.json")
     train_ds, val_ds, tokenizer = prepare_data(tok_path, data_dir, seq_len=cfg.max_seq_len)
 
-    train_loader = DataLoader(
-        train_ds, batch_size=micro_batch, shuffle=True,
-        num_workers=num_workers, pin_memory=pin_memory,
-        drop_last=True, persistent_workers=num_workers > 0,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=micro_batch, shuffle=False,
-        num_workers=num_workers, pin_memory=pin_memory,
-        persistent_workers=num_workers > 0,
-    )
-
     # ---------------------------------------------------------------- model
     model = LoopedLatentController(cfg, use_checkpoint=use_ckpt).to(device)
 
@@ -197,6 +189,28 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
     for head in model.addr_heads:
         for p in head.parameters():
             p.requires_grad_(False)
+
+    # ------------------------------------------------ auto-calibrate batch size
+    target_effective = micro_batch * grad_accum
+    if device == 'cuda':
+        trial = build_trial_fn(model, cfg, device, use_amp, amp_dtype,
+                               has_memory=True, act_steps=1)
+        micro_batch, grad_accum = auto_calibrate_batch_size(
+            trial, device, micro_batch,
+            target_effective=target_effective,
+            target_vram_frac=0.90,
+        )
+
+    train_loader = DataLoader(
+        train_ds, batch_size=micro_batch, shuffle=True,
+        num_workers=num_workers, pin_memory=pin_memory,
+        drop_last=True, persistent_workers=num_workers > 0,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=micro_batch, shuffle=False,
+        num_workers=num_workers, pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+    )
 
     # Memory systems
     train_memory = MemorySystem(train_mem_dir, mcfg)
@@ -267,34 +281,50 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
                 inp = inp.to(device, non_blocking=True)
                 tgt = tgt.to(device, non_blocking=True)
 
-                # Read memory per sample (each sample gets its own memory vectors)
-                with torch.no_grad():
-                    _, _, hid_nm = model(inp, return_hidden=True)
-                    mem_list = []
-                    for b in range(inp.size(0)):
-                        h_b = hid_nm[b, -1, :]
-                        addrs_b = model.compute_addresses(h_b)
-                        addr_bs_b = [addr_bytes(a) for a in addrs_b]
-                        mem_vecs_b = train_memory.read_memory(addr_bs_b)
-                        mem_list.append(
-                            memory_vecs_to_tensor(mem_vecs_b, cfg.d_model, device)
+                try:
+                    # Read memory per sample (each sample gets its own memory vectors)
+                    with torch.no_grad():
+                        _, _, hid_nm = model(inp, return_hidden=True)
+                        mem_list = []
+                        for b in range(inp.size(0)):
+                            h_b = hid_nm[b, -1, :]
+                            addrs_b = model.compute_addresses(h_b)
+                            addr_bs_b = [addr_bytes(a) for a in addrs_b]
+                            mem_vecs_b = train_memory.read_memory(addr_bs_b)
+                            mem_list.append(
+                                memory_vecs_to_tensor(mem_vecs_b, cfg.d_model, device)
+                            )
+                        mem_tensor = torch.cat(mem_list, dim=0)  # (B, n_mem, d_model)
+
+                    with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+                        logits, _, hidden = model(inp, memory_vectors=mem_tensor, return_hidden=True)
+
+                        # LM loss on text positions only (memory positions excluded)
+                        loss = F.cross_entropy(
+                            logits.reshape(-1, logits.size(-1)),
+                            tgt.reshape(-1),
+                            ignore_index=cfg.pad_id,
                         )
-                    mem_tensor = torch.cat(mem_list, dim=0)  # (B, n_mem, d_model)
+                        loss = loss / grad_accum
 
-                with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-                    logits, _, hidden = model(inp, memory_vectors=mem_tensor, return_hidden=True)
+                    scaler.scale(loss).backward()
+                    accum_loss += loss.item()
+                    tokens_seen += inp.numel()
 
-                    # LM loss on text positions only (memory positions excluded)
-                    loss = F.cross_entropy(
-                        logits.reshape(-1, logits.size(-1)),
-                        tgt.reshape(-1),
-                        ignore_index=cfg.pad_id,
-                    )
-                    loss = loss / grad_accum
-
-                scaler.scale(loss).backward()
-                accum_loss += loss.item()
-                tokens_seen += inp.numel()
+                except torch.cuda.OutOfMemoryError:
+                    micro_batch, grad_accum, rebuild = handle_oom(
+                        micro_batch, grad_accum, target_effective)
+                    if rebuild:
+                        train_loader = DataLoader(
+                            train_ds, batch_size=micro_batch, shuffle=True,
+                            num_workers=num_workers, pin_memory=pin_memory,
+                            drop_last=True, persistent_workers=num_workers > 0)
+                        loader_iter = iter(train_loader)
+                        tokens_per_step = micro_batch * grad_accum * cfg.max_seq_len
+                        total_steps = pcfg.total_tokens // tokens_per_step
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_loss = 0.0
+                    break
 
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), pcfg.max_grad_norm)
