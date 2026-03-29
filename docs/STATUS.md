@@ -1,6 +1,6 @@
 # LatentController — Project Status & Objectives
 
-## Current State (March 29, 2026)
+## Current State (March 30, 2026)
 
 ### What Works
 - ✅ **Phase 1 COMPLETE** — Baseline LM trained on TinyStories, checkpoint on HuggingFace (`kaaninel/latentcontroller`)
@@ -9,20 +9,23 @@
 - ✅ Agent + Orchestrator inference API
 - ✅ Colab notebook for A100 training
 - ✅ Hardware auto-detection for A100/H100/T4/CPU
+- ✅ **Phase 2 OOM fixed** — On-the-fly cosine similarity per mini-batch
+- ✅ **Phase 3 & 4 memory fixed** — Per-sample memory lookup
+- ✅ **Phase 3 position fixed** — Correct mid_text_pos calculation
+- ✅ **Hardware configs fixed** — Gradient checkpointing enabled, batch sizes right-sized for A100 40GB
+- ✅ **Configurable datasets** — `dataset.py` accepts any HuggingFace dataset with column mapping
+- ✅ **NOOP target generation** — Data-driven NOOP targets from context/response structure
+- ✅ **Phase 5 implemented** — Unified streaming training with all systems active
 
 ### What's Broken
-- ❌ **Phase 2 crashes immediately** — OOM from 800K×800K cosine similarity matrix (2.56 TB)
-- ❌ **Phase 3 & 4 memory bug** — All batch samples share one memory lookup (sample 0 only)
-- ❌ **Phase 3 position indexing** — Memory write uses wrong position in hidden states
-- ❌ **A100 40GB VRAM overestimation** — Hardware configs don't account for ACT iteration memory growth
+- (All previously identified critical bugs are fixed)
 
 ### What's Missing
-- ❌ Streaming training (batch training ≠ token-by-token inference)
-- ❌ NOOP token training (selective emission)
-- ❌ Hard ACT halting training (only soft halting trained)
-- ❌ Configurable dataset (hardcoded to TinyStories)
-- ❌ Streaming dataset loading (full dataset loaded to RAM)
-- ❌ Phase 5 (unified integration on harder data)
+- ❌ HuggingFace streaming dataset mode (full dataset loaded to RAM)
+- ❌ OOM safety (auto batch-size reduction)
+- ❌ True token-by-token streaming training (Phase 5 uses full-sequence causal as approximation)
+- ❌ Distributed training (DDP/FSDP)
+- ❌ **Phases 2-5 not yet trained** — Code ready, needs Colab A100 execution
 
 ---
 
@@ -85,15 +88,18 @@ After bugs are fixed:
 4. Validate at each phase: eval loss, memory utilization stats, halt histograms
 5. Push checkpoints to HuggingFace at each phase
 
-### Objective 7: Design and Implement Phase 5
-**Priority:** P2 — After Phase 4 works
+### Objective 7: Phase 5 — Unified Streaming Training ✅ IMPLEMENTED
+**Priority:** P2 → DONE
 
-1. Select harder training dataset (beyond TinyStories)
-2. Unfreeze address heads at 0.3× base LR
-3. All systems active: memory read/write + ACT + backbone
-4. Combined loss: LM + ponder penalty
-5. ACT curriculum: max_pondering 4→6, ponder_weight 0.002→0.005
-6. Consider streaming training mode for this phase
+Phase 5 is implemented in `train_phase5.py` with:
+1. ✅ Unified loop: read mem → ACT forward (per-step memory re-reads) → write mem → predict
+2. ✅ NOOP targets from data structure (context→NOOP, response→real tokens)
+3. ✅ Address heads unfrozen at 0.3× base LR with separate optimizer param group
+4. ✅ ACT curriculum annealing toward near-hard halting (T=0.05)
+5. ✅ Multi-position memory writes (every 64 positions + last)
+6. ✅ Configurable dataset support via `--dataset_name`, `--text_column`, `--context_column`
+7. ✅ Cascade checkpoint loading: Phase 4 > Phase 3 > Phase 1
+8. Needs: actual training run on A100 40GB Colab
 
 ---
 

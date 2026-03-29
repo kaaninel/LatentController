@@ -38,9 +38,12 @@ def ensure_tokenizer(data_dir: str, vocab_size: int = 16384):
 
 def main():
     parser = argparse.ArgumentParser(description="Looped Latent Controller trainer")
-    parser.add_argument("--phase",          type=int,   required=True, choices=[1, 2, 3, 4])
+    parser.add_argument("--phase",          type=int,   required=True, choices=[1, 2, 3, 4, 5])
     parser.add_argument("--checkpoint_dir", type=str,   default="./checkpoints")
     parser.add_argument("--data_dir",       type=str,   default="./data")
+    parser.add_argument("--dataset_name",   type=str,   default=None, help="HuggingFace dataset (default: TinyStories)")
+    parser.add_argument("--text_column",    type=str,   default="text", help="Text/response column name")
+    parser.add_argument("--context_column", type=str,   default=None, help="Context column for NOOP training")
     parser.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
@@ -78,6 +81,15 @@ def main():
         elif args.phase == 4:
             from train_phase4 import train
             train(args.checkpoint_dir, args.data_dir, resume=args.resume)
+
+        elif args.phase == 5:
+            from train_phase5 import train
+            train(
+                args.checkpoint_dir, args.data_dir, resume=args.resume,
+                dataset_name=args.dataset_name,
+                text_column=args.text_column,
+                context_column=args.context_column,
+            )
 
     except KeyboardInterrupt:
         print("\nTraining interrupted by user.")

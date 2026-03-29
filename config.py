@@ -99,6 +99,39 @@ class Phase4Config:
 
 
 @dataclass
+class Phase5Config:
+    lr: float = 3e-5
+    min_lr: float = 1e-6
+    warmup_steps: int = 500
+    weight_decay: float = 0.1
+    betas: tuple = (0.9, 0.95)
+    micro_batch: int = 2
+    grad_accum: int = 16
+    total_tokens: int = 2_000_000_000
+    max_grad_norm: float = 1.0
+    eval_interval: int = 5000
+    save_interval: int = 10000
+    log_interval: int = 500
+
+    # Address head learning rate multiplier (slower to prevent address drift)
+    addr_head_lr_mult: float = 0.3
+
+    # Streaming ACT — re-read memory between ACT steps
+    streaming_act: bool = True
+    ponder_curriculum: list = field(default_factory=lambda: [
+        (0,      4, 0.002, 0.5),      # moderate ACT, soft halting
+        (20000,  6, 0.005, 0.1),      # sharper halting
+        (50000,  6, 0.005, 0.05),     # near-hard halting
+    ])
+
+    # Memory write frequency during training (every N positions within a sequence)
+    write_every_n_positions: int = 64
+
+    # Eval memory refresh from train memory
+    eval_memory_refresh_interval: int = 20000
+
+
+@dataclass
 class MemoryConfig:
     alpha_base: float = 0.1
     max_write_count: int = 65535

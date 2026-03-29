@@ -117,42 +117,35 @@ If psutil is not installed, `info['ram_gb']` becomes 0, which may cause incorrec
 
 ## Architectural Gaps (Training ↔ Inference Mismatch)
 
-### GAP-001: No Streaming Training — Critical
-**Severity:** CRITICAL for real-world use
+### GAP-001: No Streaming Training — Critical ✅ ADDRESSED (Phase 5)
+**Severity:** CRITICAL for real-world use → Addressed by Phase 5
 
-**Training**: Processes full sequences `[BOS, tok1, ..., tok499, EOS, PAD]` at once.
-**Inference**: Agent calls `process_token()` one token at a time with growing context.
+Phase 5 (`train_phase5.py`) implements unified streaming training where every token goes through the same loop: read memory → ACT forward (with per-step memory re-reads) → write memory → predict next token. This matches the agent's `process_token()` behavior. Multi-position memory writes simulate per-token memory updates. Note: still uses full-sequence causal attention (not true token-by-token), but this is a reasonable approximation that closes most of the gap.
 
-The model is **never trained** in the mode it actually runs during inference. This creates mismatches in:
-- Memory read frequency (once per batch vs. every token)
-- ACT behavior (soft weighted vs. hard cutoff)
-- Hidden state persistence (fresh each batch vs. carried across calls)
-- Context growth (full sequence vs. incrementally growing)
+### GAP-002: NOOP Token Never Trained ✅ ADDRESSED (Phase 5)
+**Severity:** HIGH → Addressed by Phase 5
 
-### GAP-002: NOOP Token Never Trained
-**Severity:** HIGH
+Phase 5 supports data-driven NOOP targets via `context_column` in the dataset. Context portions get NOOP targets (model learns to stay silent), response portions get real next-token targets (model learns to emit). The dataset builder in `dataset.py` handles this automatically.
 
-`noop_id=6` is reserved in config but never appears in training data. The agent supports selective emission (return None when uncertain), but the model was never taught when to stay silent.
+### GAP-003: Soft vs Hard ACT Halting ✅ PARTIALLY ADDRESSED (Phase 5)
+**Severity:** HIGH → Phase 5 anneals temperature to T=0.05
 
-### GAP-003: Soft vs Hard ACT Halting
-**Severity:** HIGH
+Phase 5 uses a ponder curriculum that anneals temperature from 0.5→0.1→0.05, approaching near-hard halting. At T=0.05 the softmax becomes very peaked, behaving close to hard cutoff. Not truly hard (threshold-based), but significantly closer to inference behavior.
 
-Phase 4 trains with **soft halting** (weighted average of all loop steps). The agent uses **hard halting** (`p(halt) > 0.5` → stop immediately). The model never learns the hard cutoff behavior it will use at inference time.
+### GAP-004: Memory Not Per-ACT-Step ✅ ADDRESSED (Phase 5)
+**Severity:** MEDIUM → Addressed by Phase 5
 
-### GAP-004: Memory Not Per-ACT-Step
-**Severity:** MEDIUM
-
-The agent re-reads memory every call, but during ACT iterations within Phase 4 training, memory is read once at the beginning and held constant through all ACT steps. The model doesn't learn to re-consult memory mid-thought.
+`streaming_act_forward()` re-reads memory between ACT steps. On each step, the model computes new addresses from the updated hidden state and reads fresh memory vectors. This matches the agent's behavior where addresses shift as the model "thinks".
 
 ### GAP-005: No Training for Agent State Persistence
 **Severity:** MEDIUM
 
 The agent maintains `self.h` (persistent hidden state) across `process_token()` calls. Training always starts fresh from full context — there's no training for carrying state across inference calls.
 
-### GAP-006: Dataset Hardcoded to TinyStories
-**Severity:** HIGH for scaling
+### GAP-006: Dataset Hardcoded to TinyStories ✅ FIXED
+**Severity:** HIGH → Fixed in `dataset.py`
 
-`dataset.py` hardcodes `load_dataset("roneneldan/TinyStories", split="train")`. No parameter to switch datasets. Tokenizer is trained only on 500K TinyStories samples with `vocab_size=16384`.
+`prepare_data()` now accepts `dataset_name`, `text_column`, `context_column`, `split`, and `max_samples` parameters. Works with any HuggingFace dataset. Backward compatible — defaults to TinyStories.
 
 ### GAP-007: No Streaming Dataset Loading
 **Severity:** MEDIUM for large datasets

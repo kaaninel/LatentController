@@ -83,6 +83,7 @@ def _t4_config(info):
         'phase2': {'batch_size': 4000},
         'phase3': {'micro_batch': 32, 'grad_accum': 4},
         'phase4': {'micro_batch': 16, 'grad_accum': 8},
+        'phase5': {'micro_batch': 8, 'grad_accum': 16},
         'num_workers': min(4, info['cpu_count']),
         'use_compile': True,
         'use_amp': True,
@@ -98,6 +99,7 @@ def _a100_40gb_config(info):
         'phase2': {'batch_size': 8000},
         'phase3': {'micro_batch': 64, 'grad_accum': 2},
         'phase4': {'micro_batch': 32, 'grad_accum': 4},
+        'phase5': {'micro_batch': 16, 'grad_accum': 8},
         'num_workers': min(8, info['cpu_count']),
         'use_compile': True,
         'use_amp': True,
@@ -113,6 +115,7 @@ def _a100_80gb_config(info):
         'phase2': {'batch_size': 16000},
         'phase3': {'micro_batch': 128, 'grad_accum': 1},
         'phase4': {'micro_batch': 64, 'grad_accum': 2},
+        'phase5': {'micro_batch': 32, 'grad_accum': 4},
         'num_workers': min(16, info['cpu_count']),
         'use_compile': True,
         'use_amp': True,
@@ -128,6 +131,7 @@ def _h100_config(info):
         'phase2': {'batch_size': 16000},
         'phase3': {'micro_batch': 192, 'grad_accum': 1},
         'phase4': {'micro_batch': 96, 'grad_accum': 2},
+        'phase5': {'micro_batch': 48, 'grad_accum': 2},
         'num_workers': min(16, info['cpu_count']),
         'use_compile': True,
         'use_amp': True,
@@ -146,6 +150,7 @@ def _l40_config(info):
             'phase2': {'batch_size': 8000},
             'phase3': {'micro_batch': 96, 'grad_accum': 1},
             'phase4': {'micro_batch': 48, 'grad_accum': 2},
+            'phase5': {'micro_batch': 24, 'grad_accum': 4},
             'num_workers': min(8, info['cpu_count']),
             'use_compile': True,
             'use_amp': True,
@@ -159,6 +164,7 @@ def _l40_config(info):
             'phase2': {'batch_size': 4000},
             'phase3': {'micro_batch': 48, 'grad_accum': 2},
             'phase4': {'micro_batch': 24, 'grad_accum': 4},
+            'phase5': {'micro_batch': 12, 'grad_accum': 8},
             'num_workers': min(8, info['cpu_count']),
             'use_compile': True,
             'use_amp': True,
@@ -174,6 +180,7 @@ def _v100_config(info):
         'phase2': {'batch_size': 8000},
         'phase3': {'micro_batch': 64, 'grad_accum': 2},
         'phase4': {'micro_batch': 32, 'grad_accum': 4},
+        'phase5': {'micro_batch': 16, 'grad_accum': 8},
         'num_workers': min(8, info['cpu_count']),
         'use_compile': True,
         'use_amp': True,
@@ -192,6 +199,7 @@ def _rtx_config(info, vram):
         'phase2': {'batch_size': 4000},
         'phase3': {'micro_batch': mb // 2, 'grad_accum': 2},
         'phase4': {'micro_batch': mb // 4, 'grad_accum': 4},
+        'phase5': {'micro_batch': mb // 8 or 2, 'grad_accum': 8},
         'num_workers': min(8, info['cpu_count']),
         'use_compile': True,
         'use_amp': True,
@@ -209,6 +217,7 @@ def _generic_config(info, vram):
             'phase2': {'batch_size': 4000},
             'phase3': {'micro_batch': 32, 'grad_accum': 2},
             'phase4': {'micro_batch': 16, 'grad_accum': 4},
+            'phase5': {'micro_batch': 8, 'grad_accum': 8},
             'num_workers': min(4, info['cpu_count']),
             'use_compile': True,
             'use_amp': True,
@@ -221,6 +230,7 @@ def _generic_config(info, vram):
             'phase2': {'batch_size': 2000},
             'phase3': {'micro_batch': 12, 'grad_accum': 2},
             'phase4': {'micro_batch': 6, 'grad_accum': 2},
+            'phase5': {'micro_batch': 2, 'grad_accum': 8},
             'num_workers': min(2, info['cpu_count']),
             'use_compile': False,
             'use_amp': True,
@@ -235,6 +245,7 @@ def _cpu_config():
         'phase2': {'batch_size': 500},
         'phase3': {'micro_batch': 2, 'grad_accum': 16},
         'phase4': {'micro_batch': 1, 'grad_accum': 32},
+        'phase5': {'micro_batch': 1, 'grad_accum': 32},
         'num_workers': 0,
         'use_compile': False,
         'use_amp': False,
@@ -268,7 +279,7 @@ def print_hardware_report(info):
     print(f"  torch.compile:   {'Enabled' if ov.get('use_compile') else 'Disabled'}")
     print(f"  Grad Checkpoint: {'Enabled' if ov.get('gradient_checkpointing') else 'Disabled'}")
     print(f"  DataLoader Workers: {ov.get('num_workers', 2)}")
-    for phase_name in ['phase1', 'phase2', 'phase3', 'phase4']:
+    for phase_name in ['phase1', 'phase2', 'phase3', 'phase4', 'phase5']:
         if phase_name in ov:
             pc = ov[phase_name]
             if 'micro_batch' in pc:
