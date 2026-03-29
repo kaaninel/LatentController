@@ -240,17 +240,21 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
                 inp = inp.to(device, non_blocking=True)
                 tgt = tgt.to(device, non_blocking=True)
 
-                # Read memory
+                # Read memory (per-sample lookup)
                 mem_tensor = None
                 if train_memory is not None:
                     with torch.no_grad():
                         _, _, hid_nm = model(inp, return_hidden=True)
-                        h0 = hid_nm[0, -1, :]
-                        addrs = model.compute_addresses(h0)
-                        ab    = [addr_bytes(a) for a in addrs]
-                        mvecs = train_memory.read_memory(ab)
-                        mem_tensor = memory_vecs_to_tensor(mvecs, cfg.d_model, device)
-                        mem_tensor = mem_tensor.expand(inp.size(0), -1, -1)
+                        mem_list = []
+                        for b in range(inp.size(0)):
+                            h_b = hid_nm[b, -1, :]
+                            addrs_b = model.compute_addresses(h_b)
+                            ab_b = [addr_bytes(a) for a in addrs_b]
+                            mvecs_b = train_memory.read_memory(ab_b)
+                            mem_list.append(
+                                memory_vecs_to_tensor(mvecs_b, cfg.d_model, device)
+                            )
+                        mem_tensor = torch.cat(mem_list, dim=0)  # (B, n_mem, d_model)
 
                 with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                     weighted_logits, expected_steps, counts = act_forward(

@@ -92,16 +92,18 @@ def evaluate_with_memory(
         )
         total_loss_no_mem += loss_nm.item()
 
-        # --- with memory (use last token's hidden from no-mem pass) ---
+        # --- with memory (per-sample lookup) ---
         _, _, hid = model(inp, return_hidden=True)
-        # Take [0, -1, :] as representative hidden state for address computation
-        h = hid[0, -1, :]  # (d_model,)
-        addrs = model.compute_addresses(h)
-        addr_bs = [addr_bytes(a) for a in addrs]
-        mem_vecs = eval_memory.read_memory(addr_bs)
-        mem_tensor = memory_vecs_to_tensor(mem_vecs, cfg.d_model, device)
+        mem_list = []
+        for b_idx in range(inp.size(0)):
+            h = hid[b_idx, -1, :]  # (d_model,)
+            addrs = model.compute_addresses(h)
+            addr_bs = [addr_bytes(a) for a in addrs]
+            mem_vecs = eval_memory.read_memory(addr_bs)
+            mem_list.append(memory_vecs_to_tensor(mem_vecs, cfg.d_model, device))
+        mem_tensor = torch.cat(mem_list, dim=0)  # (B, n_mem, d_model)
 
-        logits_m, _ = model(inp, memory_vectors=mem_tensor.expand(inp.size(0), -1, -1))
+        logits_m, _ = model(inp, memory_vectors=mem_tensor)
         loss_m = F.cross_entropy(
             logits_m.reshape(-1, logits_m.size(-1)),
             tgt.reshape(-1),
@@ -265,16 +267,19 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
                 inp = inp.to(device, non_blocking=True)
                 tgt = tgt.to(device, non_blocking=True)
 
-                # Read memory for this batch (use zeros-based lookup the first pass)
+                # Read memory per sample (each sample gets its own memory vectors)
                 with torch.no_grad():
                     _, _, hid_nm = model(inp, return_hidden=True)
-                    h0 = hid_nm[0, -1, :]
-                    addrs = model.compute_addresses(h0)
-                    addr_bs = [addr_bytes(a) for a in addrs]
-                    mem_vecs = train_memory.read_memory(addr_bs)
-                    mem_tensor = memory_vecs_to_tensor(mem_vecs, cfg.d_model, device)
-                    # Expand to batch size
-                    mem_tensor = mem_tensor.expand(inp.size(0), -1, -1)
+                    mem_list = []
+                    for b in range(inp.size(0)):
+                        h_b = hid_nm[b, -1, :]
+                        addrs_b = model.compute_addresses(h_b)
+                        addr_bs_b = [addr_bytes(a) for a in addrs_b]
+                        mem_vecs_b = train_memory.read_memory(addr_bs_b)
+                        mem_list.append(
+                            memory_vecs_to_tensor(mem_vecs_b, cfg.d_model, device)
+                        )
+                    mem_tensor = torch.cat(mem_list, dim=0)  # (B, n_mem, d_model)
 
                 with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                     logits, _, hidden = model(inp, memory_vectors=mem_tensor, return_hidden=True)
@@ -303,7 +308,9 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
                 with torch.no_grad():
                     # Use a position from the middle of the text sequence as a
                     # representative hidden state (avoids edge effects at BOS/EOS).
-                    mid_text_pos = cfg.n_mem_positions + hidden.shape[1] // 2
+                    text_start = cfg.n_mem_positions
+                    text_len = hidden.shape[1] - text_start
+                    mid_text_pos = text_start + text_len // 2
                     for b in range(hidden.shape[0]):
                         h = hidden[b, mid_text_pos, :]
                         vec_np = h.detach().float().cpu().numpy()

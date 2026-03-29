@@ -12,3 +12,5 @@ checkpoints/
 data/
 *.pt
 *.bin
+conv/
+*.ipynb.DS_Store

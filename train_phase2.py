@@ -179,13 +179,9 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
     )
     print(f"Collected {hiddens.shape[0]:,} × {hiddens.shape[1]}-d hidden states")
 
-    # Precompute pairwise cosine similarities (done in batches to save memory)
-    print("Precomputing pairwise cosine similarities…")
-    hiddens_norm = F.normalize(hiddens.float(), dim=-1)
-    cos_sims = torch.mm(hiddens_norm, hiddens_norm.T)  # (N, N)
-    # Move to device
+    # Pre-normalize on CPU (cheap); cosine sims computed on-the-fly per batch
+    hiddens_norm = F.normalize(hiddens.float(), dim=-1)  # (N, d_model) on CPU
     hiddens = hiddens.to(device)
-    cos_sims = cos_sims.to(device)
 
     # Training loop
     N = hiddens.shape[0]
@@ -204,7 +200,10 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
         # Random mini-batch
         idx = torch.randperm(N, device=device)[:batch_size]
         batch = hiddens[idx]
-        sim_batch = cos_sims[idx][:, idx]
+
+        # Compute cosine similarity on-the-fly for this mini-batch only: (B, B)
+        batch_norm = hiddens_norm[idx.cpu()].to(device)  # (B, d_model)
+        sim_batch = torch.mm(batch_norm, batch_norm.T)   # (B, B) — fits in VRAM
 
         loss = contrastive_loss(
             model.addr_heads,
