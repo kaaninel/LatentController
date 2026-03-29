@@ -118,27 +118,32 @@ Input: token_ids (B, T_text) + optional memory_vectors (B, n_mem, d_model)
 - Collect 800K hidden states from Phase 1 model
 - Contrastive loss: similar hidden states → similar addresses
 - Target: 10K steps
-- **Status: BLOCKED** (OOM bug — see BUGS.md)
+- **Status: READY** (OOM bug fixed — on-the-fly cosine similarity)
 
 ### Phase 3: Memory Integration
 - Unfreeze backbone at lower LR (1e-4)
 - Live memory building: read before forward, write every 5 steps
 - Train model to use memory context for better predictions
 - Target: 2B tokens
-- **Status: BLOCKED** (per-sample memory bug — see BUGS.md)
+- **Status: READY** (per-sample memory bug fixed)
 
 ### Phase 4: ACT Training
 - Train adaptive computation with ponder curriculum
 - Gradually increase loop iterations and ponder penalty
 - Model learns when to think more vs. emit quickly
 - Target: 1B tokens
-- **Status: BLOCKED** (depends on Phase 3)
+- **Status: READY** (per-sample memory bug fixed)
 
-### Phase 5: Unified Integration (designed, not implemented)
+### Phase 5: Unified Streaming Training
 - Load all trained components, unfreeze address heads at 0.3× LR
-- Train on harder dataset (beyond TinyStories)
-- All systems active simultaneously
-- Streaming architecture needed
+- All systems active: memory read/write + streaming ACT + backbone
+- Streaming ACT re-reads memory between ACT steps (matches agent inference)
+- Multi-position memory writes (every 64 tokens + end of sequence)
+- NOOP targets from data structure when context_column provided
+- Ponder curriculum anneals temperature to T=0.05 (near-hard halting)
+- Configurable dataset support (any HuggingFace dataset)
+- Target: 2B tokens
+- **Status: READY** (implemented in `train_phase5.py`)
 
 ## Agent & Orchestrator
 
@@ -167,6 +172,7 @@ Input: token_ids (B, T_text) + optional memory_vectors (B, n_mem, d_model)
 ### Planned But Not Yet Implemented
 - **Multi-token prediction** (K=4 heads) — designed but dropped for V1 (conflicts with action tokens)
 - **Backspace tokens** (`<bs1>` through `<bs8>`) — designed, not trained
-- **`<NOOP>` selective emission** — reserved token, never trained
 - **Multi-agent collaboration** — orchestrator API exists, no training data
-- **Streaming training mode** — critical gap between batch training and token-by-token inference
+- **True token-by-token streaming training** — Phase 5 uses full-sequence causal as approximation
+- **Hard ACT halting training** — Phase 5 anneals to near-hard (T=0.05), not truly hard
+- **HuggingFace streaming dataset** — large datasets still require full RAM load

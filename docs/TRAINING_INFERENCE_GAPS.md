@@ -1,42 +1,37 @@
 # LatentController — Training↔Inference Gap Analysis
 
-This document catalogs every identified mismatch between how the model is trained and how the agent uses it at inference time. These gaps must be addressed for the model to work correctly in production.
+This document catalogs every identified mismatch between how the model is trained and how the agent uses it at inference time.
+
+**Last updated:** March 30, 2026 (after Phase 5 implementation)
 
 ## Critical Gaps
 
-### 1. Batch vs. Streaming Processing
-| | Training | Inference (Agent) |
-|---|---|---|
-| **Input** | Full sequence `[BOS, t1, ..., t499, EOS, PAD]` | One token at a time via `process_token()` |
-| **Context** | All 512 positions available at once | Growing buffer from 1 to 501 tokens |
-| **Memory read** | Once per batch step | Every `process_token()` call |
-| **Memory write** | Every N training steps | Every token (when enabled) |
-| **Hidden state** | Fresh each batch | Persistent `self.h` across calls |
-| **ACT halting** | Soft weighted average | Hard cutoff at threshold |
+### 1. Batch vs. Streaming Processing — ✅ MOSTLY ADDRESSED (Phase 5)
+| | Training (Phase 3-4) | Training (Phase 5) | Inference (Agent) |
+|---|---|---|---|
+| **Input** | Full sequence at once | Full sequence (causal) | One token at a time |
+| **Memory read** | Once per batch step | Per-sample + re-read per ACT step | Every `process_token()` |
+| **Memory write** | Every N steps | Every 64 positions + end | Every token |
+| **ACT halting** | Soft weighted average | Soft (T annealed to 0.05) | Hard cutoff |
 
-**Impact:** The model was never trained to handle incrementally growing context, persistent state, or per-token memory access. These are fundamental to the agent's operation.
+**Phase 5 closes most of the gap:** per-sample memory reads, per-ACT-step memory re-reads, multi-position memory writes. The remaining difference is full-sequence causal attention vs true token-by-token — a reasonable approximation since causal masking prevents future token leakage.
 
-**Mitigation:** Phase 5a streaming training — simulate the agent loop during training.
+### 2. Soft vs. Hard ACT Halting — ✅ PARTIALLY ADDRESSED (Phase 5)
+**Phase 4:** Soft halting with temperature annealed to T=0.1
+**Phase 5:** Soft halting with temperature annealed to T=0.05 (near-hard)
+**Agent:** Hard cutoff at `p(halt) > 0.5`
 
-### 2. Soft vs. Hard ACT Halting
-**Training (Phase 4):** `output = Σ(halt_weight_t × hidden_t)` — weighted average of all ACT steps.
-**Inference (Agent):** `if p(halt) > 0.5: break` — hard cutoff, only use last step's output.
+At T=0.05, the softmax becomes very peaked — close to hard halting. Full hard halting training (Gumbel-Softmax / straight-through) remains a future improvement.
 
-The model learns a smooth blending function but is evaluated with binary decisions. It may never learn to produce a clean halt probability because soft halting always "works" during training.
+### 3. NOOP / Selective Emission — ✅ ADDRESSED (Phase 5)
+**Phase 5** supports data-driven NOOP targets when a `context_column` is provided:
+- Context positions → NOOP target (model learns to stay silent)
+- Response positions → real next-token target (model learns to emit)
 
-**Mitigation:** Anneal from soft→hard halting during Phase 4 curriculum. At later stages, use Gumbel-Softmax or straight-through estimator for halt decisions.
+The model learns autonomously when to absorb vs emit from the data structure.
 
-### 3. NOOP / Selective Emission
-**Training:** Every position has a real token target. Model always predicts next token.
-**Inference:** Agent can return `None` (stay silent). Uses NOOP concept but token ID 6 is never trained.
-
-**Mitigation:** Create training data with `<NOOP>` targets at 5-10% of positions. Positions where the model should "think" but not "speak" get NOOP labels.
-
-### 4. Memory Read Frequency
-**Training (Phase 3-4):** Memory read once at batch start, held constant through forward pass and all ACT iterations.
-**Inference:** Memory re-read after each token emission, potentially updated between reads.
-
-**Mitigation:** During ACT iterations in training, re-read memory between steps (expensive but faithful).
+### 4. Memory Read Frequency — ✅ ADDRESSED (Phase 5)
+**Phase 5** `streaming_act_forward()` re-reads memory between ACT steps. On each step, the model computes new addresses from the updated hidden state and reads fresh memory. This matches the agent's behavior exactly.
 
 ## Medium Gaps
 
@@ -81,15 +76,23 @@ No training for recovering from memory corruption, address space drift, or unexp
 
 ---
 
-## Recommended Phase 5a: Streaming Training
+## Phase 5 Implementation Summary
 
-To close the critical gaps, a streaming training mode should:
+Phase 5 (`train_phase5.py`) closes gaps 1-4 with its unified streaming training:
 
-1. **Process tokens sequentially** with growing context (not full-sequence teacher forcing)
-2. **Read memory every step** (not once per batch)
-3. **Use hard ACT halting** (annealed from soft)
-4. **Include NOOP targets** (5-10% of positions)
-5. **Carry hidden state** across positions within a sequence (simulate agent's `self.h`)
-6. **Write memory during training** after each ACT completion
+| Gap | Status | How |
+|-----|--------|-----|
+| Batch vs Streaming | ✅ Mostly closed | Per-sample memory, multi-position writes, causal masking |
+| Soft vs Hard ACT | ✅ Partially closed | Temperature annealed to T=0.05 (near-hard) |
+| NOOP training | ✅ Closed | Data-driven NOOP targets from context/response structure |
+| Memory read frequency | ✅ Closed | Per-ACT-step memory re-reads in `streaming_act_forward()` |
+| Context truncation | ❌ Open | No mid-sequence truncation training |
+| Memory dependence | ❌ Open | Needs retrieval-augmented training data |
+| Document ingestion | ✅ Partially closed | NOOP targets simulate passive absorption |
 
-This is significantly more expensive than standard training but is necessary for the agent to work correctly at inference time.
+### Remaining Future Work
+- True token-by-token streaming (vs full-sequence causal approximation)
+- Hard ACT halting via Gumbel-Softmax / straight-through estimator
+- Retrieval-augmented training for forced memory dependence
+- Multi-agent communication training
+- Persistent hidden state training across sequence boundaries
