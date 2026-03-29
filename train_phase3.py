@@ -403,7 +403,7 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
                     f"  [eval @ step {step}]\n"
                     f"    No-mem  loss={metrics['loss_no_mem']:.4f}  ppl={metrics['ppl_no_mem']:.2f}\n"
                     f"    W/mem   loss={metrics['loss_mem']:.4f}  ppl={metrics['ppl_mem']:.2f}\n"
-                    f"    Δ ppl: {metrics['ppl_no_mem'] - metrics['ppl_mem']:+.2f} (negative = memory helps)",
+                    f"    Δ ppl: {metrics['ppl_no_mem'] - metrics['ppl_mem']:+.2f} (positive = memory helps)",
                     flush=True,
                 )
 
