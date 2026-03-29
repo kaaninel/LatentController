@@ -165,8 +165,8 @@ class LoopedLatentController(nn.Module):
             for _ in range(cfg.n_addr_heads)
         ])
 
-        # RoPE cache (full context: mem + text)
-        total_pos = cfg.n_mem_positions + cfg.n_text_positions
+        # RoPE cache (full context: mem + text — must cover max possible sequence)
+        total_pos = cfg.n_mem_positions + cfg.max_seq_len
         cos, sin = precompute_rope(cfg.head_dim, total_pos, cfg.rope_theta)
         self.register_buffer("rope_cos", cos)
         self.register_buffer("rope_sin", sin)
@@ -184,8 +184,8 @@ class LoopedLatentController(nn.Module):
 
         # mem+text asymmetric mask — used in Phases 3/4
         n_mem_max  = cfg.n_mem_positions    # 11  (<MEM> + slots + </MEM>)
-        n_text_max2 = cfg.n_text_positions  # 501
-        T_max = n_mem_max + n_text_max2     # 512
+        n_text_max2 = cfg.max_seq_len       # 512 (absolute max text length)
+        T_max = n_mem_max + n_text_max2     # 523
         mem_text = torch.zeros(T_max, T_max)
         # Memory rows: block all text columns
         mem_text[:n_mem_max, n_mem_max:] = neg_inf
