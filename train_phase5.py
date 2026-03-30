@@ -416,6 +416,9 @@ def train(
     halt_hist = Counter()
     total_mem_writes = 0
 
+    if use_compile:
+        print("  ⏳ First step will trigger torch.compile (may take 1-3 min)…", flush=True)
+
     try:
         while step < total_steps:
             # LR schedule — same schedule for both param groups (ratio preserved)
@@ -490,70 +493,96 @@ def train(
                             train_ds, batch_size=micro_batch, shuffle=True,
                             num_workers=num_workers, pin_memory=pin_memory,
                             drop_last=True, persistent_workers=num_workers > 0)
+                        val_loader = DataLoader(
+                            val_ds, batch_size=max(1, micro_batch // 4), shuffle=False,
+                            num_workers=num_workers, pin_memory=pin_memory,
+                            persistent_workers=num_workers > 0)
                         loader_iter = iter(train_loader)
                         tokens_per_step = micro_batch * grad_accum * cfg.max_seq_len
                         total_steps = pcfg.total_tokens // tokens_per_step
+                        print(f"  → Settled: micro_batch={micro_batch}, grad_accum={grad_accum}, "
+                              f"effective={micro_batch*grad_accum}, total_steps={total_steps:,}", flush=True)
                     optimizer.zero_grad(set_to_none=True)
                     accum_loss = 0.0
                     halt_hist.clear()
                     break
+            else:
+                # for-loop completed without break (no OOM) — do optimizer step
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), pcfg.max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                step += 1
 
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), pcfg.max_grad_norm)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-            step += 1
+                # Logging — every step
+                if step % pcfg.log_interval == 0:
+                    elapsed = timer.elapsed()
+                    pct = 100.0 * step / total_steps
+                    eta_secs = (total_steps - step) * (elapsed / max(step, 1))
+                    total_halt = sum(halt_hist.values())
+                    avg_halt = sum(k * v for k, v in halt_hist.items()) / max(total_halt, 1)
+                    tok_per_sec = tokens_seen / max(elapsed, 1e-6)
+                    vram_str = vram_report()
+                    peak_str = f"{peak_vram():.1f}"
+                    print(
+                        f"[Phase 5] Step {step}/{total_steps} ({pct:.1f}%)\n"
+                        f"  Loss: {accum_loss:.4f} | Halt: {avg_halt:.1f} steps\n"
+                        f"  max_s={max_act} pw={ponder_w:.3f} T={temperature:.2f}\n"
+                        f"  MemWrites: {total_mem_writes:,}\n"
+                        f"  VRAM: {vram_str} | Peak: {peak_str} GB\n"
+                        f"  Tokens: {tokens_seen/1e9:.3f}B/{total_tokens_fmt} ({tok_per_sec:.0f} tok/s)\n"
+                        f"  ETA: {format_eta(eta_secs)} | Elapsed: {format_time(elapsed)}",
+                        flush=True,
+                    )
+                    accum_loss = 0.0
+                    halt_hist.clear()
 
-            # Logging
-            if step % pcfg.log_interval == 0:
-                elapsed = timer.elapsed()
-                pct = 100.0 * step / total_steps
-                eta_secs = (total_steps - step) * (elapsed / max(step, 1))
-                total_halt = sum(halt_hist.values())
-                avg_halt = sum(k * v for k, v in halt_hist.items()) / max(total_halt, 1)
-                tok_per_sec = tokens_seen / max(elapsed, 1e-6)
-                print(
-                    f"[Phase 5] Step {step}/{total_steps} ({pct:.1f}%)\n"
-                    f"  Loss: {accum_loss:.4f} | Halt: {avg_halt:.1f} steps\n"
-                    f"  max_s={max_act} pw={ponder_w:.3f} T={temperature:.2f}\n"
-                    f"  MemWrites: {total_mem_writes:,}\n"
-                    f"  VRAM: {vram_report()} | Peak: {peak_vram():.1f} GB\n"
-                    f"  Tokens: {tokens_seen/1e9:.3f}B/{total_tokens_fmt} ({tok_per_sec:.0f} tok/s)\n"
-                    f"  ETA: {format_eta(eta_secs)} | Elapsed: {format_time(elapsed)}",
-                    flush=True,
-                )
-                accum_loss = 0.0
-                halt_hist.clear()
+                if step == 1:
+                    print(f"  ✓ First step completed — training is running", flush=True)
 
-            # Evaluation
-            if step % pcfg.eval_interval == 0:
-                # Free training VRAM before eval (ACT loop needs ~4× forward pass memory)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # Evaluation
+                if step % pcfg.eval_interval == 0:
+                    # Free training VRAM before eval (ACT loop needs ~4× forward pass memory)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
-                # Refresh eval memory periodically
-                if step % pcfg.eval_memory_refresh_interval == 0:
-                    shutil.rmtree(eval_mem_dir, ignore_errors=True)
-                    shutil.copytree(train_mem_dir, eval_mem_dir)
-                    eval_memory = MemorySystem(eval_mem_dir, mcfg)
-                    print(f"  Refreshed eval memory from train memory")
+                    # Refresh eval memory periodically
+                    if step % pcfg.eval_memory_refresh_interval == 0:
+                        shutil.rmtree(eval_mem_dir, ignore_errors=True)
+                        shutil.copytree(train_mem_dir, eval_mem_dir)
+                        eval_memory = MemorySystem(eval_mem_dir, mcfg)
+                        print(f"  Refreshed eval memory from train memory")
 
-                metrics = evaluate_streaming(
-                    model, val_loader, eval_memory, device, cfg,
-                    max_act_steps=max_act, temperature=temperature,
-                )
-                print(
-                    f"  [Eval] Loss: {metrics['loss']:.4f} | "
-                    f"PPL: {metrics['perplexity']:.2f} | "
-                    f"Best: {best_loss:.4f}"
-                )
+                    metrics = evaluate_streaming(
+                        model, val_loader, eval_memory, device, cfg,
+                        max_act_steps=max_act, temperature=temperature,
+                    )
+                    print(
+                        f"  [Eval] Loss: {metrics['loss']:.4f} | "
+                        f"PPL: {metrics['perplexity']:.2f} | "
+                        f"Best: {best_loss:.4f}"
+                    )
 
-                if metrics["loss"] < best_loss:
-                    best_loss = metrics["loss"]
+                    if metrics["loss"] < best_loss:
+                        best_loss = metrics["loss"]
+                        save_checkpoint(
+                            model, optimizer, step, best_loss,
+                            os.path.join(phase5_dir, "best.pt"),
+                            extra={
+                                "tokens_seen": tokens_seen,
+                                "best_loss": best_loss,
+                                "scaler": scaler.state_dict() if use_scaler else None,
+                                "addr_heads": [h.state_dict() for h in model.addr_heads],
+                            },
+                        )
+
+                # Save checkpoint
+                if step % pcfg.save_interval == 0:
+                    train_memory.flush_to_disk()
                     save_checkpoint(
-                        model, optimizer, step, best_loss,
-                        os.path.join(phase5_dir, "best.pt"),
+                        model, optimizer, step, accum_loss,
+                        os.path.join(phase5_dir, "latest.pt"),
                         extra={
                             "tokens_seen": tokens_seen,
                             "best_loss": best_loss,
@@ -561,20 +590,6 @@ def train(
                             "addr_heads": [h.state_dict() for h in model.addr_heads],
                         },
                     )
-
-            # Save checkpoint
-            if step % pcfg.save_interval == 0:
-                train_memory.flush_to_disk()
-                save_checkpoint(
-                    model, optimizer, step, accum_loss,
-                    os.path.join(phase5_dir, "latest.pt"),
-                    extra={
-                        "tokens_seen": tokens_seen,
-                        "best_loss": best_loss,
-                        "scaler": scaler.state_dict() if use_scaler else None,
-                        "addr_heads": [h.state_dict() for h in model.addr_heads],
-                    },
-                )
 
     except KeyboardInterrupt:
         print("\nInterrupted — saving…")
