@@ -205,13 +205,14 @@ def train(
     dataset_name: Optional[str] = None,
     text_column: str = "text",
     context_column: Optional[str] = None,
+    phase_config: Optional[Phase5Config] = None,
 ):
     hw = detect_hardware()
     print_hardware_report(hw)
     ov = hw['overrides']
 
     cfg = ModelConfig()
-    pcfg = Phase5Config()
+    pcfg = phase_config or Phase5Config()
     mcfg = MemoryConfig()
     device = hw['device']
 

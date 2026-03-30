@@ -132,6 +132,16 @@ class Phase5Config:
 
 
 @dataclass
+class Gen1Config(Phase5Config):
+    """Gen 1: Memory QA training on bAbI + SQuAD + TinyStories replay."""
+    total_tokens: int = 500_000_000
+    lr: float = 5e-5
+    eval_interval: int = 2000
+    save_interval: int = 5000
+    log_interval: int = 200
+
+
+@dataclass
 class MemoryConfig:
     alpha_base: float = 0.1
     max_write_count: int = 65535
