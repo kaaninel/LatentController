@@ -107,7 +107,10 @@ def download_checkpoints():
     snapshot_download(
         repo_id="kaaninel/latentcontroller",
         local_dir="./",
-        allow_patterns=["checkpoints/**", "data_cache/**"],
+        allow_patterns=[
+            "checkpoints/**/best.pt",
+            "data_cache/tokenizer.json",
+        ],
     )
     print("✓ Done")
 
