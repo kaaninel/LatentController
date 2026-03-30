@@ -67,20 +67,31 @@ def load_model(checkpoint_dir: str, data_dir: str, device: torch.device):
     model = LoopedLatentController(cfg, use_checkpoint=False).to(device)
     param_count = sum(p.numel() for p in model.parameters())
 
-    # Find best checkpoint
+    # Find best checkpoint (prefer inference-only, fall back to full)
     loaded_phase = None
     for phase in [5, 4, 3, 1]:
-        ckpt = os.path.join(checkpoint_dir, f"phase{phase}", "best.pt")
+        infer_ckpt = os.path.join(checkpoint_dir, f"phase{phase}", "best.inference.pt")
+        full_ckpt = os.path.join(checkpoint_dir, f"phase{phase}", "best.pt")
+        ckpt = infer_ckpt if os.path.exists(infer_ckpt) else full_ckpt
         if os.path.exists(ckpt):
-            load_checkpoint(model, None, ckpt, device)
-            # Load Phase 2 address heads
-            if phase >= 3:
-                p2 = os.path.join(checkpoint_dir, "phase2", "best.pt")
-                if os.path.exists(p2):
-                    p2_data = torch.load(p2, map_location=device, weights_only=False)
-                    if "addr_heads" in p2_data:
-                        for i, h in enumerate(model.addr_heads):
-                            h.load_state_dict(p2_data["addr_heads"][i])
+            ckpt_data = torch.load(ckpt, map_location=device, weights_only=False)
+            # Load model weights
+            state_dict = ckpt_data["model"]
+            cleaned = {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
+            model.load_state_dict(cleaned, strict=False)
+            # Load address heads from checkpoint or Phase 2
+            if "addr_heads" in ckpt_data:
+                for i, h in enumerate(model.addr_heads):
+                    h.load_state_dict(ckpt_data["addr_heads"][i])
+            elif phase >= 3:
+                for ext in ["best.inference.pt", "best.pt"]:
+                    p2 = os.path.join(checkpoint_dir, "phase2", ext)
+                    if os.path.exists(p2):
+                        p2_data = torch.load(p2, map_location=device, weights_only=False)
+                        if "addr_heads" in p2_data:
+                            for i, h in enumerate(model.addr_heads):
+                                h.load_state_dict(p2_data["addr_heads"][i])
+                        break
             loaded_phase = phase
             break
 
@@ -108,6 +119,7 @@ def download_checkpoints():
         repo_id="kaaninel/latentcontroller",
         local_dir="./",
         allow_patterns=[
+            "checkpoints/**/*.inference.pt",
             "checkpoints/**/best.pt",
             "data_cache/tokenizer.json",
         ],

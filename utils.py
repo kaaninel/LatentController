@@ -46,6 +46,14 @@ def save_checkpoint(model, optimizer, step: int, loss: float, path: str, extra: 
     torch.save(payload, path)
     print(f"Saved checkpoint → {path}  (step={step}, loss={loss:.4f})")
 
+    # Save inference-only checkpoint (model weights only, ~3× smaller)
+    infer_path = path.replace(".pt", ".inference.pt")
+    infer_payload = {"step": step, "loss": loss, "model": model.state_dict()}
+    # Include addr_heads if present (needed for memory addressing)
+    if extra and "addr_heads" in extra:
+        infer_payload["addr_heads"] = extra["addr_heads"]
+    torch.save(infer_payload, infer_path)
+
 
 def load_checkpoint(model, optimizer, path: str, device) -> dict:
     ckpt = torch.load(path, map_location=device, weights_only=False)
