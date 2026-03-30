@@ -312,6 +312,16 @@ def train(
                 p.requires_grad_(True)
         print("Loaded Phase 2 address heads (UNFROZEN for Phase 5)")
 
+    # ------------------------------------------------ torch.compile
+    use_compile = ov.get('use_compile', False)
+    if use_compile:
+        print("Compiling model with torch.compile...")
+        try:
+            model = torch.compile(model, mode='reduce-overhead')
+        except Exception as e:
+            print(f"  torch.compile failed ({e}), continuing without compilation.")
+            use_compile = False
+
     # ------------------------------------------------ auto-calibrate batch size
     max_curriculum_steps = max(s[1] for s in pcfg.ponder_curriculum)
     target_effective = micro_batch * grad_accum
