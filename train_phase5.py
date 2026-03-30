@@ -62,6 +62,9 @@ def streaming_act_forward(
       2. Compute halt weights (soft halting with temperature)
       3. Re-read memory from updated hidden states for next step
 
+    Uses gradient checkpointing per ACT step to avoid holding all 4 forward
+    pass graphs in memory simultaneously (~55GB savings on A100).
+
     Returns (weighted_logits, expected_steps, halt_counts, final_hidden).
     """
     B, T = inp.shape
@@ -74,12 +77,28 @@ def streaming_act_forward(
     halt_step_counts = Counter()
     final_hidden = None
 
-    for i in range(max_steps):
+    def _act_step(inp_t, mem_t, remaining_t, step_idx_t):
+        """Single ACT step — wrapped for gradient checkpointing."""
         logits, halt_logits, hidden = model(
-            inp, memory_vectors=mem_tensor, return_hidden=True
+            inp_t, memory_vectors=mem_t, return_hidden=True
         )
-        final_hidden = hidden
         halt_prob = F.softmax(halt_logits / max(temperature, 1e-6), dim=-1)[..., HALT]
+        return logits, halt_prob, hidden
+
+    for i in range(max_steps):
+        step_idx = torch.tensor(i, device=device)
+
+        if model.training:
+            # Checkpoint: recompute this ACT step during backward instead of
+            # holding all 4 forward pass activation graphs simultaneously
+            logits, halt_prob, hidden = torch.utils.checkpoint.checkpoint(
+                _act_step, inp, mem_tensor, remaining, step_idx,
+                use_reentrant=False,
+            )
+        else:
+            logits, halt_prob, hidden = _act_step(inp, mem_tensor, remaining, step_idx)
+
+        final_hidden = hidden
 
         if i < max_steps - 1:
             w = remaining * halt_prob
@@ -302,7 +321,7 @@ def train(
         micro_batch, grad_accum = auto_calibrate_batch_size(
             trial, device, micro_batch,
             target_effective=target_effective,
-            target_vram_frac=0.90,
+            target_vram_frac=0.80,
         )
 
     train_loader = DataLoader(
@@ -416,9 +435,6 @@ def train(
     halt_hist = Counter()
     total_mem_writes = 0
 
-    if ov.get('use_compile'):
-        print("  ⏳ First step will trigger torch.compile (may take 1-3 min)…", flush=True)
-
     try:
         while step < total_steps:
             # LR schedule — same schedule for both param groups (ratio preserved)
@@ -523,18 +539,30 @@ def train(
                     total_halt = sum(halt_hist.values())
                     avg_halt = sum(k * v for k, v in halt_hist.items()) / max(total_halt, 1)
                     tok_per_sec = tokens_seen / max(elapsed, 1e-6)
-                    vram_str = vram_report()
-                    peak_str = f"{peak_vram():.1f}"
+
+                    # Compact one-liner every step
                     print(
-                        f"[Phase 5] Step {step}/{total_steps} ({pct:.1f}%)\n"
-                        f"  Loss: {accum_loss:.4f} | Halt: {avg_halt:.1f} steps\n"
-                        f"  max_s={max_act} pw={ponder_w:.3f} T={temperature:.2f}\n"
-                        f"  MemWrites: {total_mem_writes:,}\n"
-                        f"  VRAM: {vram_str} | Peak: {peak_str} GB\n"
-                        f"  Tokens: {tokens_seen/1e9:.3f}B/{total_tokens_fmt} ({tok_per_sec:.0f} tok/s)\n"
-                        f"  ETA: {format_eta(eta_secs)} | Elapsed: {format_time(elapsed)}",
+                        f"[Step {step}/{total_steps}] "
+                        f"loss={accum_loss:.4f} halt={avg_halt:.1f} "
+                        f"lr={lr:.2e} "
+                        f"tok/s={tok_per_sec:.0f} "
+                        f"ETA={format_eta(eta_secs)}",
                         flush=True,
                     )
+
+                    # Detailed block every 100 steps
+                    if step % 100 == 0:
+                        vram_str = vram_report()
+                        peak_str = f"{peak_vram():.1f}"
+                        print(
+                            f"  ── max_s={max_act} pw={ponder_w:.3f} T={temperature:.2f} "
+                            f"MemWrites={total_mem_writes:,}\n"
+                            f"  ── VRAM: {vram_str} | Peak: {peak_str} GB\n"
+                            f"  ── Tokens: {tokens_seen/1e9:.3f}B/{total_tokens_fmt} "
+                            f"({pct:.1f}%) | Elapsed: {format_time(elapsed)}",
+                            flush=True,
+                        )
+
                     accum_loss = 0.0
                     halt_hist.clear()
 

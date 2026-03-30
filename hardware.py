@@ -117,7 +117,8 @@ def build_trial_fn(model, cfg, device, use_amp, amp_dtype,
     Build a trial function for batch-size calibration.
 
     The returned callable runs one forward+backward pass that mirrors
-    the real training step (including memory prepend and ACT iterations).
+    the real training step: initial memory-read forward pass (no_grad)
+    + ACT iterations (with gradient checkpointing) + loss backward.
     """
     from torch.amp import autocast
 
@@ -131,11 +132,23 @@ def build_trial_fn(model, cfg, device, use_amp, amp_dtype,
                               device=device, dtype=amp_dtype if use_amp
                               else torch.float32)
 
+        # Simulate the initial memory-read forward pass (no_grad)
+        if has_memory:
+            with torch.no_grad():
+                with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+                    _, _, hid = model(inp, memory_vectors=mem, return_hidden=True)
+                    del hid
+
+        def _act_step(inp_t, mem_t):
+            logits, halt_logits, hidden = model(
+                inp_t, memory_vectors=mem_t, return_hidden=True)
+            return logits, hidden
+
         with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
             weighted = None
             for _ in range(act_steps):
-                logits, halt_logits, hidden = model(
-                    inp, memory_vectors=mem, return_hidden=True)
+                logits, hidden = torch.utils.checkpoint.checkpoint(
+                    _act_step, inp, mem, use_reentrant=False)
                 if weighted is None:
                     weighted = logits
                 else:
