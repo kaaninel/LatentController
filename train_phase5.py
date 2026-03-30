@@ -172,6 +172,7 @@ def evaluate_streaming(
             _, _, hid = model(inp, return_hidden=True)
             h_last = hid[:, -1, :]  # (B, d_model)
             mem_tensor = batch_read_memory(model, h_last, eval_memory, cfg, device)
+            del hid, h_last  # free before ACT loop
 
         # Streaming ACT forward
         weighted_logits, _, _, _ = streaming_act_forward(
@@ -187,6 +188,7 @@ def evaluate_streaming(
         mask = tgt.reshape(-1) != cfg.pad_id
         total_loss += loss.item()
         total_tokens += mask.sum().item()
+        del weighted_logits, loss, mem_tensor
 
     avg_loss = total_loss / max(1, total_tokens)
     ppl = math.exp(min(avg_loss, 100))
@@ -305,7 +307,7 @@ def train(
         drop_last=True, persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=micro_batch, shuffle=False,
+        val_ds, batch_size=max(1, micro_batch // 4), shuffle=False,
         num_workers=num_workers, pin_memory=pin_memory,
         persistent_workers=num_workers > 0,
     )
@@ -522,6 +524,10 @@ def train(
 
             # Evaluation
             if step % pcfg.eval_interval == 0:
+                # Free training VRAM before eval (ACT loop needs ~4× forward pass memory)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
                 # Refresh eval memory periodically
                 if step % pcfg.eval_memory_refresh_interval == 0:
                     shutil.rmtree(eval_mem_dir, ignore_errors=True)
