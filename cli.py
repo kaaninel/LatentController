@@ -243,6 +243,7 @@ def run_interactive(orch: Orchestrator, args):
                 print(f"  Temperature:     {args.temperature}")
                 print(f"  Top-k:           {args.top_k}")
                 print(f"  Max tokens:      {args.max_tokens}")
+                print(f"  Rep penalty:     {args.repetition_penalty}")
                 print(f"  Quantization:    {args.quantize}")
                 print(f"  Device:          {orch.device}")
                 print()
@@ -260,7 +261,8 @@ def run_interactive(orch: Orchestrator, args):
         )
         orch.feed(agent, user_input)
         response = orch.generate(agent, max_tokens=args.max_tokens,
-                                 temperature=args.temperature, top_k=args.top_k)
+                                 temperature=args.temperature, top_k=args.top_k,
+                                 repetition_penalty=args.repetition_penalty)
         dt = time.perf_counter() - t0
 
         tok_count = len(orch.tokenizer.encode(response).ids) if response else 0
@@ -308,6 +310,8 @@ def main():
                         help="ACT halting steps (1-6, default=2)")
     parser.add_argument("--emit-threshold", type=float, default=0.3,
                         help="Token emission confidence threshold")
+    parser.add_argument("--repetition-penalty", type=float, default=1.3,
+                        help="Repetition penalty (1.0=off, default=1.3)")
     parser.add_argument("--quantize", choices=["fp32", "q8", "q4"], default="fp32",
                         help="Weight quantization: fp32 (default), q8 (int8), q4 (int4)")
     parser.add_argument("--download", action="store_true",

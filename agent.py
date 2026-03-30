@@ -109,7 +109,8 @@ class Agent:
 
     @torch.no_grad()
     def process_token(self, token_id: int, temperature: float = 1.0,
-                      top_k: int = 0) -> Optional[int]:
+                      top_k: int = 0, repetition_penalty: float = 1.0,
+                      recent_tokens: list | None = None) -> Optional[int]:
         """
         1. Compute addresses from self.h → read memory (up to 9 vectors).
         2. Append token to context_buffer (cap at 501).
@@ -136,15 +137,13 @@ class Agent:
         # Step 3: ACT hard halting with split KV-cache
         final_logits = None
         for act_step in range(self.max_act_steps):
-            mem_tensor = self._build_mem_tensor(mem_vecs)
-            n_mem = mem_tensor.shape[1] + 2  # +2 for <MEM>, </MEM>
-
             has_cache = self.text_kv_cache is not None
 
             if has_cache and act_step == 0:
-                # INCREMENTAL: fresh memory K,V + cached text K,V + 1 new token
-                new_mem_kv = self.model.forward_memory(mem_tensor)
-                combined = self._combine_kv(new_mem_kv, self.text_kv_cache)
+                # INCREMENTAL: reuse stale mem K,V + cached text K,V + 1 new token
+                # (mem K,V from previous token — same as pre-split-cache behavior)
+                combined = self._combine_kv(self.mem_kv_cache, self.text_kv_cache)
+                n_mem = self.n_mem_positions
                 cache_pos = n_mem + self.text_cache_len
 
                 inp = torch.tensor([[token_id]], dtype=torch.long, device=self.device)
@@ -153,17 +152,16 @@ class Agent:
                     kv_cache=combined, cache_position=cache_pos,
                 )
 
-                self.mem_kv_cache = new_mem_kv
-                _, self.text_kv_cache = self._split_kv(returned_cache, n_mem)
-                self.n_mem_positions = n_mem
+                self.mem_kv_cache, self.text_kv_cache = self._split_kv(returned_cache, n_mem)
                 self.text_cache_len += 1
 
             elif has_cache and act_step > 0:
                 # ACT RE-READ: fresh memory K,V + cached text K,V (minus last)
                 # + reprocess last text token. Cost: 11 + 1 positions vs 11+T.
+                mem_tensor = self._build_mem_tensor(mem_vecs)
+                n_mem = mem_tensor.shape[1] + 2
                 new_mem_kv = self.model.forward_memory(mem_tensor)
 
-                # Strip last text token's K,V (will be recomputed with new memory context)
                 stripped_text_kv = [
                     (k[:, :, :-1, :], v[:, :, :-1, :])
                     for k, v in self.text_kv_cache
@@ -181,10 +179,11 @@ class Agent:
                 self.mem_kv_cache = new_mem_kv
                 _, self.text_kv_cache = self._split_kv(returned_cache, n_mem)
                 self.n_mem_positions = n_mem
-                # text_cache_len unchanged (stripped last, re-added it)
 
             else:
                 # PREFILL: first token or cache invalidated — full forward
+                mem_tensor = self._build_mem_tensor(mem_vecs)
+                n_mem = mem_tensor.shape[1] + 2
                 inp = self._build_input()
                 logits, halt_logits, hidden, returned_cache = self.model(
                     inp, memory_vectors=mem_tensor, return_hidden=True,
@@ -215,6 +214,15 @@ class Agent:
             return None
 
         last_logits = final_logits[0, -1, :]            # (vocab_size,)
+
+        # Apply repetition penalty to recently emitted tokens
+        if repetition_penalty != 1.0 and recent_tokens:
+            penalty_ids = set(recent_tokens[-64:])  # last 64 tokens
+            for tid in penalty_ids:
+                if last_logits[tid] > 0:
+                    last_logits[tid] /= repetition_penalty
+                else:
+                    last_logits[tid] *= repetition_penalty
 
         # Apply temperature
         if temperature > 0 and temperature != 1.0:

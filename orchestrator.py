@@ -55,36 +55,52 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def generate(self, agent: Agent, max_tokens: int = 500,
-                 temperature: float = 0.8, top_k: int = 50) -> str:
+                 temperature: float = 0.8, top_k: int = 50,
+                 repetition_penalty: float = 1.3) -> str:
         """
         Drive the agent to emit tokens until EOS or max_tokens.
-        Uses temperature sampling with top-k to avoid degenerate repetition.
+        Uses temperature sampling with top-k and repetition penalty.
+        Detects degenerate n-gram loops and stops early.
         """
         eos_id = self.tokenizer.token_to_id("<eos>") or 1
 
         emitted: List[int] = []
 
         for _ in range(max_tokens):
-            # Use the agent's last emitted token as next input,
-            # or run a forward on current context to get first token
             if emitted:
-                out = agent.process_token(emitted[-1], temperature=temperature, top_k=top_k)
+                out = agent.process_token(emitted[-1], temperature=temperature,
+                                          top_k=top_k,
+                                          repetition_penalty=repetition_penalty,
+                                          recent_tokens=emitted)
             else:
-                # Re-run last token to get logits for continuation
                 if agent.context_buffer:
                     out = agent.process_token(
-                        agent.context_buffer[-1], temperature=temperature, top_k=top_k
+                        agent.context_buffer[-1], temperature=temperature,
+                        top_k=top_k, repetition_penalty=repetition_penalty,
+                        recent_tokens=emitted,
                     )
                 else:
                     out = agent.process_token(
                         self.tokenizer.token_to_id("<bos>") or 2,
                         temperature=temperature, top_k=top_k,
+                        repetition_penalty=repetition_penalty,
+                        recent_tokens=emitted,
                     )
             if out is None:
                 continue
             if out == eos_id:
                 break
             emitted.append(out)
+
+            # Detect degenerate n-gram loop (e.g. "kid kid kid kid")
+            if len(emitted) >= 12:
+                for n in (1, 2, 3):
+                    tail = emitted[-6*n:]
+                    pattern = tail[-n:]
+                    repeats = sum(1 for i in range(0, len(tail) - n + 1, n)
+                                 if tail[i:i+n] == pattern)
+                    if repeats >= 5:
+                        return self.tokenizer.decode(emitted[:-n*4])
 
         return self.tokenizer.decode(emitted)
 
