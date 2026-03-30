@@ -206,6 +206,45 @@ class LoopedLatentController(nn.Module):
         self.register_buffer("mem_text_mask", mem_text)
 
     # ------------------------------------------------------------------
+    # Memory-only forward (for split KV-cache)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def forward_memory(self, memory_vectors: torch.Tensor) -> list:
+        """
+        Process memory positions through all layers independently.
+
+        Since memory rows cannot attend to text (masked), the K,V computed
+        here are identical to those in a joint [mem+text] forward pass.
+
+        memory_vectors : (B, n_mem_slots, d_model) — float tensor
+        Returns list of (k, v) per layer, each k,v shape (B, H, n_mem_pos, D).
+        """
+        B = memory_vectors.shape[0]
+        device = memory_vectors.device
+
+        mem_start = self.embed(
+            torch.full((B, 1), self.cfg.mem_start_id, dtype=torch.long, device=device)
+        )
+        mem_end = self.embed(
+            torch.full((B, 1), self.cfg.mem_end_id, dtype=torch.long, device=device)
+        )
+        x = torch.cat([mem_start, memory_vectors, mem_end], dim=1)  # (B, n_mem, d)
+
+        n_mem = x.shape[1]
+        # Memory-only block of the asymmetric mask (all-to-all, no text)
+        mask = self.mem_text_mask[:n_mem, :n_mem]
+        cos = self.rope_cos[:n_mem]
+        sin = self.rope_sin[:n_mem]
+
+        mem_kvs = []
+        for layer in self.layers:
+            x, layer_kv = layer(x, mask, cos, sin)
+            mem_kvs.append(layer_kv)
+
+        return mem_kvs
+
+    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
