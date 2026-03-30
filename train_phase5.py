@@ -251,13 +251,17 @@ def train(
     model = LoopedLatentController(cfg, use_checkpoint=use_ckpt).to(device)
 
     # Load best checkpoint: Phase 4 > Phase 3 > Phase 1
+    # Try best.pt first, then latest.pt for each phase
     loaded_from = None
     for phase, name in [(phase4_dir, "Phase 4"), (phase3_dir, "Phase 3"),
                         (os.path.join(checkpoint_dir, "phase1"), "Phase 1")]:
-        best_path = os.path.join(phase, "best.pt")
-        if os.path.exists(best_path):
-            load_checkpoint(model, None, best_path, device)
-            loaded_from = name
+        for ckpt_name in ["best.pt", "latest.pt"]:
+            ckpt_path = os.path.join(phase, ckpt_name)
+            if os.path.exists(ckpt_path):
+                load_checkpoint(model, None, ckpt_path, device)
+                loaded_from = f"{name} ({ckpt_name})"
+                break
+        if loaded_from:
             break
     if loaded_from:
         print(f"Loaded backbone from {loaded_from}")
