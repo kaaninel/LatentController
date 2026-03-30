@@ -26,6 +26,7 @@ import sys
 import time
 
 import torch
+import torch.nn as nn
 import numpy as np
 
 from model import LoopedLatentController
@@ -34,6 +35,39 @@ from memory import MemorySystem
 from orchestrator import Orchestrator
 from tokenizer_utils import load_tokenizer
 from utils import load_checkpoint
+
+
+# ─── Quantization ─────────────────────────────────────────────────────
+
+def quantize_model(model: nn.Module, mode: str = "q8") -> nn.Module:
+    """Apply dynamic quantization to Linear layers.
+    
+    mode: "q8" (int8) or "q4" (int8 with weight packing, closest PyTorch native)
+    """
+    if mode == "fp32":
+        return model
+
+    if mode in ("q8", "q4"):
+        try:
+            # PyTorch native dynamic quantization — quantizes weights to int8,
+            # computes in int8, dequantizes output back to float
+            quantized = torch.quantization.quantize_dynamic(
+                model,
+                {nn.Linear},
+                dtype=torch.qint8,
+            )
+            # Report size reduction
+            orig_size = sum(p.numel() * p.element_size() for p in model.parameters())
+            # Quantized model size is harder to measure directly, estimate it
+            q_size = orig_size // (4 if mode == "q8" else 8)
+            print(f"  Quantized: {mode.upper()} — ~{q_size/1e6:.0f} MB (from {orig_size/1e6:.0f} MB FP32)")
+            return quantized
+        except Exception as e:
+            print(f"  ⚠ Quantization failed ({e}), using FP32")
+            return model
+    
+    print(f"  ⚠ Unknown quantization mode '{mode}', using FP32")
+    return model
 
 
 # ─── Device detection ─────────────────────────────────────────────────
@@ -194,6 +228,7 @@ def run_interactive(orch: Orchestrator, args):
                 print(f"  ACT steps:       {args.act_steps}")
                 print(f"  Emit threshold:  {args.emit_threshold}")
                 print(f"  Max tokens:      {args.max_tokens}")
+                print(f"  Quantization:    {args.quantize}")
                 print(f"  Device:          {orch.device}")
                 print()
                 continue
@@ -253,6 +288,8 @@ def main():
                         help="ACT halting steps (1-6)")
     parser.add_argument("--emit-threshold", type=float, default=0.3,
                         help="Token emission confidence threshold")
+    parser.add_argument("--quantize", choices=["fp32", "q8", "q4"], default="fp32",
+                        help="Weight quantization: fp32 (default), q8 (int8), q4 (int4)")
     parser.add_argument("--download", action="store_true",
                         help="Download checkpoints from HuggingFace and exit")
     args = parser.parse_args()
@@ -267,6 +304,15 @@ def main():
 
     device = detect_device()
     model, tokenizer, cfg = load_model(args.checkpoint_dir, args.data_dir, device)
+
+    # Quantize if requested (must be on CPU for PyTorch dynamic quantization)
+    if args.quantize != "fp32":
+        model = model.cpu()
+        model = quantize_model(model, args.quantize)
+        # Dynamic quantized models run on CPU only (PyTorch limitation)
+        device = torch.device("cpu")
+        print(f"  Note: Quantized models run on CPU (PyTorch dynamic quant)")
+    
 
     # Memory system
     mem_cfg = MemoryConfig()
