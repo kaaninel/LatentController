@@ -54,27 +54,37 @@ class Orchestrator:
     # Generate text from an agent
     # ------------------------------------------------------------------
 
-    def generate(self, agent: Agent, max_tokens: int = 500) -> str:
+    def generate(self, agent: Agent, max_tokens: int = 500,
+                 temperature: float = 0.8, top_k: int = 50) -> str:
         """
         Drive the agent to emit tokens until EOS or max_tokens.
-        We re-feed emitted tokens back into the agent to build context.
+        Uses temperature sampling with top-k to avoid degenerate repetition.
         """
         eos_id = self.tokenizer.token_to_id("<eos>") or 1
-        bos_id = self.tokenizer.token_to_id("<bos>") or 2
 
         emitted: List[int] = []
-        # Seed with BOS
-        agent.process_token(bos_id)
 
         for _ in range(max_tokens):
-            # Use the agent's last emitted token (or BOS) as next input
-            feed_id = emitted[-1] if emitted else bos_id
-            out = agent.process_token(feed_id)
+            # Use the agent's last emitted token as next input,
+            # or run a forward on current context to get first token
+            if emitted:
+                out = agent.process_token(emitted[-1], temperature=temperature, top_k=top_k)
+            else:
+                # Re-run last token to get logits for continuation
+                if agent.context_buffer:
+                    out = agent.process_token(
+                        agent.context_buffer[-1], temperature=temperature, top_k=top_k
+                    )
+                else:
+                    out = agent.process_token(
+                        self.tokenizer.token_to_id("<bos>") or 2,
+                        temperature=temperature, top_k=top_k,
+                    )
             if out is None:
                 continue
-            emitted.append(out)
             if out == eos_id:
                 break
+            emitted.append(out)
 
         return self.tokenizer.decode(emitted)
 
@@ -96,13 +106,15 @@ class Orchestrator:
     # High-level API
     # ------------------------------------------------------------------
 
-    def query(self, text: str, think_budget: int = 5, max_output: int = 500) -> str:
+    def query(self, text: str, think_budget: int = 5, max_output: int = 500,
+             temperature: float = 0.8, top_k: int = 50) -> str:
         """
         Feed the text into a fresh agent (think_budget ACT steps), then generate.
         """
         agent = self.create_agent(max_act_steps=think_budget)
         self.feed(agent, text)
-        return self.generate(agent, max_tokens=max_output)
+        return self.generate(agent, max_tokens=max_output,
+                             temperature=temperature, top_k=top_k)
 
     def ingest_document(self, text: str):
         """

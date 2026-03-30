@@ -227,6 +227,8 @@ def run_interactive(orch: Orchestrator, args):
             elif cmd == "/config":
                 print(f"  ACT steps:       {args.act_steps}")
                 print(f"  Emit threshold:  {args.emit_threshold}")
+                print(f"  Temperature:     {args.temperature}")
+                print(f"  Top-k:           {args.top_k}")
                 print(f"  Max tokens:      {args.max_tokens}")
                 print(f"  Quantization:    {args.quantize}")
                 print(f"  Device:          {orch.device}")
@@ -244,7 +246,8 @@ def run_interactive(orch: Orchestrator, args):
             emit_threshold=args.emit_threshold,
         )
         orch.feed(agent, user_input)
-        response = orch.generate(agent, max_tokens=args.max_tokens)
+        response = orch.generate(agent, max_tokens=args.max_tokens,
+                                 temperature=args.temperature, top_k=args.top_k)
         dt = time.perf_counter() - t0
 
         tok_count = len(orch.tokenizer.encode(response).ids) if response else 0
@@ -284,8 +287,12 @@ def main():
     parser.add_argument("--ingest", type=str, default=None,
                         help="Ingest file into memory before starting")
     parser.add_argument("--max-tokens", type=int, default=500)
-    parser.add_argument("--act-steps", type=int, default=4,
-                        help="ACT halting steps (1-6)")
+    parser.add_argument("--temperature", type=float, default=0.8,
+                        help="Sampling temperature (0.0=greedy, default=0.8)")
+    parser.add_argument("--top-k", type=int, default=50,
+                        help="Top-k sampling (0=disabled, default=50)")
+    parser.add_argument("--act-steps", type=int, default=2,
+                        help="ACT halting steps (1-6, default=2)")
     parser.add_argument("--emit-threshold", type=float, default=0.3,
                         help="Token emission confidence threshold")
     parser.add_argument("--quantize", choices=["fp32", "q8", "q4"], default="fp32",

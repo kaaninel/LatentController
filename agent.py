@@ -81,7 +81,8 @@ class Agent:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def process_token(self, token_id: int) -> Optional[int]:
+    def process_token(self, token_id: int, temperature: float = 1.0,
+                      top_k: int = 0) -> Optional[int]:
         """
         1. Compute addresses from self.h → read memory (up to 9 vectors).
         2. Append token to context_buffer (cap at 501).
@@ -129,9 +130,21 @@ class Agent:
             return None
 
         last_logits = final_logits[0, -1, :]            # (vocab_size,)
-        probs = F.softmax(last_logits, dim=-1)
-        top1_prob, top1_id = probs.max(dim=-1)
 
-        if top1_prob.item() > self.emit_threshold:
-            return top1_id.item()
+        # Apply temperature
+        if temperature > 0 and temperature != 1.0:
+            last_logits = last_logits / temperature
+
+        probs = F.softmax(last_logits, dim=-1)
+        top1_prob = probs.max().item()
+
+        if top1_prob > self.emit_threshold:
+            # Top-k sampling
+            if top_k > 0:
+                topk_probs, topk_ids = probs.topk(min(top_k, probs.size(-1)))
+                topk_probs = topk_probs / topk_probs.sum()
+                idx = torch.multinomial(topk_probs, 1).item()
+                return topk_ids[idx].item()
+            else:
+                return probs.argmax().item()
         return None
