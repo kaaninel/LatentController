@@ -206,6 +206,8 @@ def train(
     text_column: str = "text",
     context_column: Optional[str] = None,
     phase_config: Optional[Phase5Config] = None,
+    freeze_memory: bool = False,
+    preseed_memory_dir: Optional[str] = None,
 ):
     hw = detect_hardware()
     print_hardware_report(hw)
@@ -300,11 +302,15 @@ def train(
     )
 
     # ----------------------------------------------------------- memory
-    # Bootstrap from Phase 3 memory if available, else start fresh
+    # Bootstrap from pre-seeded memory, Phase 3 memory, or start fresh
     train_mem_dir = os.path.join(phase5_dir, "train_memory")
     eval_mem_dir = os.path.join(phase5_dir, "eval_memory")
 
-    if not os.path.exists(train_mem_dir):
+    if preseed_memory_dir and os.path.exists(preseed_memory_dir):
+        if not os.path.exists(train_mem_dir):
+            print(f"Bootstrapping memory from pre-seeded store: {preseed_memory_dir}")
+            shutil.copytree(preseed_memory_dir, train_mem_dir)
+    elif not os.path.exists(train_mem_dir):
         p3_mem_dir = os.path.join(phase3_dir, "train_memory")
         if os.path.exists(p3_mem_dir):
             print(f"Bootstrapping memory from Phase 3: {p3_mem_dir}")
@@ -317,6 +323,11 @@ def train(
     if not os.path.exists(eval_mem_dir):
         shutil.copytree(train_mem_dir, eval_mem_dir)
     eval_memory = MemorySystem(eval_mem_dir, mcfg)
+
+    if freeze_memory:
+        print(f"  Memory FROZEN — no writes during training ({train_memory.total_entries():,} entries)")
+    else:
+        print(f"  Memory ACTIVE — writes enabled ({train_memory.total_entries():,} entries)")
 
     # --------------------------------------------------------- optimizer
     # Two param groups: main params (full LR) + address heads (0.3× LR)
@@ -447,8 +458,8 @@ def train(
                     accum_loss += loss.item()
                     tokens_seen += inp.numel()
 
-                    # Memory writes at multiple positions
-                    if hidden is not None:
+                    # Memory writes at multiple positions (skip if frozen)
+                    if hidden is not None and not freeze_memory:
                         with torch.no_grad():
                             n_writes = write_memory_multi_position(
                                 model, hidden.detach(), train_memory, cfg,
@@ -584,10 +595,16 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_name", default=None)
     parser.add_argument("--text_column", default="text")
     parser.add_argument("--context_column", default=None)
+    parser.add_argument("--freeze_memory", action="store_true",
+                        help="Don't write to memory during training (read-only)")
+    parser.add_argument("--preseed_memory_dir", default=None,
+                        help="Path to pre-seeded memory store to bootstrap from")
     args = parser.parse_args()
     train(
         args.checkpoint_dir, args.data_dir, args.resume,
         dataset_name=args.dataset_name,
         text_column=args.text_column,
         context_column=args.context_column,
+        freeze_memory=args.freeze_memory,
+        preseed_memory_dir=args.preseed_memory_dir,
     )
