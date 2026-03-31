@@ -50,6 +50,12 @@ class Orchestrator:
                 outputs.append(out)
         return outputs
 
+    @torch.no_grad()
+    def feed_prefill(self, agent: Agent, text: str):
+        """Process text in a single forward pass (fast). Builds KV cache + writes memory once."""
+        ids = encode(self.tokenizer, text)
+        agent.feed_prefill(ids)
+
     # ------------------------------------------------------------------
     # Generate text from an agent
     # ------------------------------------------------------------------

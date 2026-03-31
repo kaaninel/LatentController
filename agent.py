@@ -88,6 +88,46 @@ class Agent:
         self.text_cache_len = 0
 
     # ------------------------------------------------------------------
+    # feed_prefill — bulk context processing in one forward pass
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def feed_prefill(self, token_ids: list):
+        """
+        Process a full token sequence in one forward pass.
+        Reads memory, builds KV cache for the whole sequence, writes memory once.
+        ~100× faster than feeding token-by-token for context/passage.
+        """
+        if not token_ids:
+            return
+
+        # Read memory based on current hidden state
+        mem_vecs = self._read_memory()
+
+        # Update context buffer (may truncate to window size)
+        self.context_buffer.extend(token_ids)
+        if len(self.context_buffer) > self.cfg.n_text_positions:
+            self.context_buffer = self.context_buffer[-self.cfg.n_text_positions:]
+
+        # Build memory + full input
+        mem_tensor = self._build_mem_tensor(mem_vecs)
+        inp = self._build_input()
+
+        # Single forward pass — no ACT loop (context doesn't need variable halting)
+        logits, halt_logits, hidden, self.kv_cache = self.model(
+            inp, memory_vectors=mem_tensor, return_hidden=True,
+            kv_cache=[], cache_position=0,
+        )
+
+        n_mem = mem_tensor.shape[1] + 2
+        self.n_mem_positions = n_mem
+        self.text_cache_len = len(self.context_buffer)
+        self.h = hidden[0, -1, :].detach()
+
+        # Write final hidden state to memory
+        self._write_memory()
+
+    # ------------------------------------------------------------------
     # process_token
     # ------------------------------------------------------------------
 
@@ -176,11 +216,11 @@ class Agent:
             # Update internal hidden state from last text position
             self.h = hidden[0, -1, :].detach()
 
-            halt_prob = F.softmax(halt_logits[0, -1, :].float().cpu(), dim=-1)[HALT].item()
+            halt_prob = F.softmax(halt_logits[0, -1, :], dim=-1)[HALT].item()
             if halt_prob > 0.5 or act_step == self.max_act_steps - 1:
                 break
 
-            # Re-read memory for next ACT step — cache is preserved!
+            # Re-read memory for next ACT step (addresses change with updated h)
             mem_vecs = self._read_memory()
 
         # Step 4: write hidden state to memory

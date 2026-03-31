@@ -12,6 +12,7 @@ checkpoints/
 data/
 data_cache/
 memory_store/
+logs/
 *.pt
 *.bin
 conv/
