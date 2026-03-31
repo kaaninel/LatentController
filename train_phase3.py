@@ -283,6 +283,8 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
 
     model.train()
     timer = Timer()
+    start_step = step
+    start_tokens = tokens_seen
     loader_iter = iter(train_loader)
     optimizer.zero_grad(set_to_none=True)
     accum_loss = 0.0
@@ -366,9 +368,9 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
                 log_interval = 1 if step == 1 else 500
                 elapsed = timer.elapsed()
                 pct = 100.0 * step / total_steps
-                eta_secs = (total_steps - step) * (elapsed / max(step, 1))
+                eta_secs = (total_steps - step) * (elapsed / max(step - start_step, 1))
                 avg_loss = accum_loss / log_interval
-                tok_per_sec = tokens_seen / max(elapsed, 1e-6)
+                tok_per_sec = (tokens_seen - start_tokens) / max(elapsed, 1e-6)
                 mem_entries = train_memory.total_entries() if hasattr(train_memory, 'total_entries') else -1
                 print(
                     f"[Phase 3] Step {step}/{total_steps} ({pct:.1f}%)\n"

@@ -242,6 +242,8 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
 
     model.train()
     timer = Timer()
+    start_step = step
+    start_tokens = tokens_seen
     loader_iter = iter(train_loader)
     optimizer.zero_grad(set_to_none=True)
     accum_loss  = 0.0
@@ -319,12 +321,12 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
             if step % 500 == 0:
                 elapsed = timer.elapsed()
                 pct = 100.0 * step / total_steps
-                eta_secs = (total_steps - step) * (elapsed / max(step, 1))
+                eta_secs = (total_steps - step) * (elapsed / max(step - start_step, 1))
                 hist_str = " ".join(f"{k}:{v}" for k, v in sorted(halt_hist.items()))
                 # Compute avg halt steps from histogram
                 total_halt = sum(halt_hist.values())
                 avg_halt = sum(k * v for k, v in halt_hist.items()) / max(total_halt, 1)
-                tok_per_sec = tokens_seen / max(elapsed, 1e-6)
+                tok_per_sec = (tokens_seen - start_tokens) / max(elapsed, 1e-6)
                 print(
                     f"[Phase 4] Step {step}/{total_steps} ({pct:.1f}%)\n"
                     f"  LM Loss: {accum_loss:.4f} | Halt: {avg_halt:.1f} steps\n"

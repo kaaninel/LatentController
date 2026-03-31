@@ -141,6 +141,8 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
 
     model.train()
     timer = Timer()
+    start_step = step
+    start_tokens = tokens_seen
     loader_iter = iter(train_loader)
     optimizer.zero_grad(set_to_none=True)
     accum_loss = 0.0
@@ -207,7 +209,8 @@ def train(checkpoint_dir: str, data_dir: str, resume: bool = False):
                 pct = 100.0 * step / total_steps
                 ppl = math.exp(min(accum_loss, 100))
                 steps_remaining = total_steps - step
-                eta_secs = steps_remaining * (elapsed / max(step, 1))
+                steps_done = step - start_step
+                eta_secs = steps_remaining * (elapsed / max(steps_done, 1))
                 print(
                     f"[Phase 1] Step {step}/{total_steps} ({pct:.1f}%) | "
                     f"Loss: {accum_loss:.4f} | PPL: {ppl:.2f} | "

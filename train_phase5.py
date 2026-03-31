@@ -425,6 +425,8 @@ def train(
 
     model.train()
     timer = Timer()
+    start_step = step  # track where this run started (for accurate tok/s and ETA)
+    start_tokens = tokens_seen
     loader_iter = iter(train_loader)
     optimizer.zero_grad(set_to_none=True)
     accum_loss = 0.0
@@ -535,11 +537,13 @@ def train(
                 # Logging — every step
                 if step % pcfg.log_interval == 0:
                     elapsed = timer.elapsed()
+                    steps_done = step - start_step
                     pct = 100.0 * step / total_steps
-                    eta_secs = (total_steps - step) * (elapsed / max(step, 1))
+                    secs_per_step = elapsed / max(steps_done, 1)
+                    eta_secs = (total_steps - step) * secs_per_step
                     total_halt = sum(halt_hist.values())
                     avg_halt = sum(k * v for k, v in halt_hist.items()) / max(total_halt, 1)
-                    tok_per_sec = tokens_seen / max(elapsed, 1e-6)
+                    tok_per_sec = (tokens_seen - start_tokens) / max(elapsed, 1e-6)
 
                     # Compact one-liner every step
                     print(
