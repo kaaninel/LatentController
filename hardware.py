@@ -117,14 +117,20 @@ def build_trial_fn(model, cfg, device, use_amp, amp_dtype,
     Build a trial function for batch-size calibration.
 
     The returned callable runs one forward+backward pass that mirrors
-    the real training step: initial memory-read forward pass (no_grad)
-    + ACT iterations (with grad) + loss backward.
+    the real training step as closely as possible, including the ACT
+    loop's halt weighting and memory re-read pattern.
     """
     from torch.amp import autocast
+
+    # Pre-allocate optimizer state so the trial measures peak VRAM
+    # with optimizer buffers already resident (as in real training)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    temp_opt = torch.optim.AdamW(trainable, lr=1e-4)
 
     def trial(bs):
         inp = torch.randint(0, cfg.vocab_size, (bs, cfg.max_seq_len),
                             device=device)
+        tgt = inp.clone()
 
         mem = None
         if has_memory:
@@ -139,24 +145,43 @@ def build_trial_fn(model, cfg, device, use_amp, amp_dtype,
                     _, _, hid = model(inp, memory_vectors=mem, return_hidden=True)
                     del hid
 
+        # Simulate the full ACT loop with halt weighting (matches streaming_act_forward)
         with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-            weighted = None
-            for _ in range(act_steps):
+            B, T = inp.shape
+            remaining = torch.ones(B, T, device=device)
+            weighted_logits = None
+            expected_steps = torch.zeros(B, T, device=device)
+
+            for i in range(act_steps):
                 logits, halt_logits, hidden = model(
                     inp, memory_vectors=mem, return_hidden=True)
-                if weighted is None:
-                    weighted = logits
+                halt_prob = F.softmax(halt_logits, dim=-1)[..., 1]
+
+                if i < act_steps - 1:
+                    w = remaining * halt_prob
                 else:
-                    weighted = weighted + logits
+                    w = remaining
+
+                if weighted_logits is None:
+                    weighted_logits = w.unsqueeze(-1) * logits
+                else:
+                    weighted_logits = weighted_logits + w.unsqueeze(-1) * logits
+
+                expected_steps = expected_steps + (i + 1) * w
+                remaining = (remaining - w).clamp(min=0.0)
 
             loss = F.cross_entropy(
-                weighted.reshape(-1, weighted.size(-1)),
-                inp.reshape(-1),  # dummy target
+                weighted_logits.reshape(-1, weighted_logits.size(-1)),
+                tgt.reshape(-1),
                 ignore_index=cfg.pad_id,
             )
 
         loss.backward()
-        model.zero_grad(set_to_none=True)
+
+        # Run an optimizer step so AdamW allocates its momentum/variance buffers,
+        # which persist during real training and contribute to baseline VRAM
+        temp_opt.step()
+        temp_opt.zero_grad(set_to_none=True)
 
     return trial
 
