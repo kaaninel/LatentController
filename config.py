@@ -24,6 +24,13 @@ class ModelConfig:
     mem_start_id: int = 4
     mem_end_id: int = 5
     noop_id: int = 6
+    # Cross-attention memory: memory accessed via dedicated cross-attention
+    # layer in each block instead of being prepended to the input sequence.
+    use_memory_cross_attention: bool = False
+    # Progressive memory controller: grow memory up to this capacity while
+    # tracking recency/usage for content-addressed updates.
+    max_memory_slots: int = 64
+    max_temporal_positions: int = 2048
 
 
 @dataclass
@@ -155,12 +162,12 @@ class MemoryConfig:
 
 @dataclass
 class MicroModelConfig:
-    """~1M param model for rapid memory-architecture prototyping."""
+    """~0.8M param model for rapid memory-architecture prototyping."""
     vocab_size: int = 256
     d_model: int = 128
-    n_heads: int = 2
-    head_dim: int = 64
-    ffn_dim: int = 512
+    n_heads: int = 4
+    head_dim: int = 32
+    ffn_dim: int = 256              # 2x expansion (tiny FFN: patterns only)
     n_layers: int = 4
     max_seq_len: int = 128
     dropout: float = 0.0
@@ -177,3 +184,9 @@ class MicroModelConfig:
     mem_start_id: int = 4
     mem_end_id: int = 5
     noop_id: int = 6
+    # Cross-attention memory: Attn → MemCrossAttn → FFN per block
+    use_memory_cross_attention: bool = True
+    # Streaming chunk encoding (video-frame paradigm)
+    chunk_size: int = 8             # tokens per chunk (language-agnostic)
+    slots_per_chunk: int = 2        # memory entries per chunk (mean + last)
+    max_temporal_chunks: int = 32   # max chunks in temporal embedding table

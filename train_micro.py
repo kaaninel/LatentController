@@ -33,6 +33,129 @@ from memory import MemorySystem
 from agent import addr_bytes, memory_vecs_to_tensor
 
 # ============================================================================
+# Verbose Logging Utilities
+# ============================================================================
+
+class TrainingTracker:
+    """Tracks running statistics for verbose logging."""
+
+    def __init__(self, window=50):
+        self.window = window
+        self.losses = []
+        self.grad_norms = []
+        self.step_times = []
+        self.best_loss = float("inf")
+        self.best_acc = 0.0
+        self.eval_history = []  # (step, acc, breakdown)
+        self._last_time = None
+
+    def tick(self):
+        now = time.time()
+        if self._last_time is not None:
+            self.step_times.append(now - self._last_time)
+        self._last_time = now
+
+    def add_loss(self, loss):
+        self.losses.append(loss)
+        if loss < self.best_loss:
+            self.best_loss = loss
+
+    def add_grad_norm(self, norm):
+        self.grad_norms.append(norm)
+
+    def add_eval(self, step, acc, breakdown=None):
+        self.eval_history.append((step, acc, breakdown))
+        if acc > self.best_acc:
+            self.best_acc = acc
+
+    @property
+    def avg_loss(self):
+        w = self.losses[-self.window:]
+        return sum(w) / len(w) if w else 0
+
+    @property
+    def avg_grad_norm(self):
+        w = self.grad_norms[-self.window:]
+        return sum(w) / len(w) if w else 0
+
+    @property
+    def steps_per_sec(self):
+        w = self.step_times[-self.window:]
+        return 1.0 / (sum(w) / len(w)) if w else 0
+
+    @property
+    def loss_trend(self):
+        """Arrow showing loss direction over last window."""
+        if len(self.losses) < self.window:
+            return "─"
+        first_half = self.losses[-self.window:-self.window // 2]
+        second_half = self.losses[-self.window // 2:]
+        avg1 = sum(first_half) / len(first_half)
+        avg2 = sum(second_half) / len(second_half)
+        diff = avg2 - avg1
+        if diff < -0.01:
+            return "↓"  # improving
+        elif diff > 0.01:
+            return "↑"  # worsening
+        return "→"  # flat
+
+
+def log_model_summary(model, cfg, label="Model"):
+    """Print detailed model configuration and parameter counts."""
+    n_total = sum(p.numel() for p in model.parameters())
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\n  ┌─── {label} Architecture ───")
+    print(f"  │ d_model={cfg.d_model}  n_heads={cfg.n_heads}  head_dim={cfg.head_dim}")
+    print(f"  │ n_layers={cfg.n_layers}  ffn_dim={cfg.ffn_dim}  max_seq={cfg.max_seq_len}")
+    max_slots = getattr(cfg, "max_memory_slots", cfg.n_mem_slots)
+    print(f"  │ mem_slots={cfg.n_mem_slots}  max_memory_slots={max_slots}  addr_heads={cfg.n_addr_heads}  addr_dim={cfg.addr_dim}")
+    print(f"  │ params: {n_total:,} total ({n_total/1e6:.2f}M), {n_train:,} trainable")
+    # Parameter breakdown by module
+    embed = sum(p.numel() for n, p in model.named_parameters() if "embed" in n or "tok_emb" in n)
+    layers = sum(p.numel() for n, p in model.named_parameters() if "layers." in n)
+    heads = sum(p.numel() for n, p in model.named_parameters() if "addr_" in n or "halt_" in n)
+    lm_head = sum(p.numel() for n, p in model.named_parameters() if "lm_head" in n or "output" in n)
+    print(f"  │ breakdown: embed={embed:,}  layers={layers:,}  heads={heads:,}  lm_head={lm_head:,}")
+    print(f"  └────────────────────")
+
+
+def log_memory_diagnostics(mem_vecs, label="Memory"):
+    """Print memory vector statistics."""
+    B, S, D = mem_vecs.shape
+    norms = mem_vecs.norm(dim=-1)  # (B, S)
+    # Pairwise cosine similarity between slots
+    normed = F.normalize(mem_vecs, dim=-1)
+    sims = torch.bmm(normed, normed.transpose(1, 2))  # (B, S, S)
+    # Mask diagonal
+    mask = ~torch.eye(S, device=sims.device, dtype=torch.bool).unsqueeze(0).expand(B, -1, -1)
+    off_diag_sim = sims[mask].reshape(B, -1)
+
+    print(f"  {label}: shape=({B},{S},{D})")
+    print(f"    norms:  mean={norms.mean():.2f}  std={norms.std():.2f}  "
+          f"min={norms.min():.2f}  max={norms.max():.2f}")
+    print(f"    cosine: mean={off_diag_sim.mean():.3f}  std={off_diag_sim.std():.3f}  "
+          f"max={off_diag_sim.max():.3f}")
+    # Variance across slots (high = diverse, low = redundant)
+    slot_var = mem_vecs.var(dim=1).mean()  # average variance across slots
+    print(f"    slot_var={slot_var:.4f} (higher=more diverse)")
+
+
+def log_gradient_stats(model):
+    """Compute and return gradient norm, also log per-module stats."""
+    total_norm = 0.0
+    module_norms = {}
+    for name, p in model.named_parameters():
+        if p.grad is not None:
+            pn = p.grad.data.norm(2).item() ** 2
+            total_norm += pn
+            # Group by first two path components
+            parts = name.split(".")
+            module = ".".join(parts[:2]) if len(parts) > 1 else parts[0]
+            module_norms[module] = module_norms.get(module, 0) + pn
+    total_norm = total_norm ** 0.5
+    return total_norm, {k: v ** 0.5 for k, v in module_norms.items()}
+
+# ============================================================================
 # Micro Tokenizer — simple word-level, ~200 tokens
 # ============================================================================
 
@@ -358,6 +481,7 @@ def train_phase_a(model, cfg, device, examples, steps=500, lr=3e-4,
     print("\n" + "=" * 60)
     print("  Phase A: Warmup LM (QA patterns, no memory)")
     print("=" * 60)
+    print(f"  Steps: {steps}  LR: {lr}  Batch: {batch_size}")
 
     ds = ContextQADataset(examples, max_len=max_len)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True)
@@ -367,7 +491,9 @@ def train_phase_a(model, cfg, device, examples, steps=500, lr=3e-4,
     loader_iter = iter(loader)
 
     t0 = time.time()
+    tracker = TrainingTracker()
     for step in range(1, steps + 1):
+        tracker.tick()
         try:
             inp, tgt = next(loader_iter)
         except StopIteration:
@@ -388,12 +514,17 @@ def train_phase_a(model, cfg, device, examples, steps=500, lr=3e-4,
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        grad_norm, _ = log_gradient_stats(model)
+        tracker.add_loss(loss.item())
+        tracker.add_grad_norm(grad_norm)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
         if step % 50 == 0 or step == 1:
             elapsed = time.time() - t0
-            print(f"  [A {step}/{steps}] loss={loss.item():.4f} lr={lr_now:.2e} ({elapsed:.0f}s)")
+            print(f"  [A {step:>4}/{steps}] loss={loss.item():.4f} "
+                  f"avg={tracker.avg_loss:.4f}{tracker.loss_trend} "
+                  f"gnorm={grad_norm:.2f} lr={lr_now:.1e} ({elapsed:.0f}s)")
 
     elapsed = time.time() - t0
     print(f"  Phase A done in {elapsed:.0f}s, final loss={loss.item():.4f}")
@@ -413,6 +544,8 @@ def train_phase_b(model, cfg, device, examples, steps=300, lr=1e-3,
     print("\n" + "=" * 60)
     print("  Phase B: Address Head Contrastive Training")
     print("=" * 60)
+    print(f"  Steps: {steps}  LR: {lr}  Batch: {batch_size}")
+    print(f"  Only training: addr_heads (backbone frozen)")
 
     # Generate hidden states for various entities
     ds = ContextQADataset(examples, max_len=max_len)
@@ -539,6 +672,8 @@ def train_phase_c(model, cfg, device, examples, steps=500, lr=1e-4,
     print("\n" + "=" * 60)
     print("  Phase C: ACT Curriculum")
     print("=" * 60)
+    print(f"  Steps: {steps}  LR: {lr}  Batch: {batch_size}")
+    print(f"  Curriculum: ramp max_steps 2→4, ponder 0→0.005")
 
     ds = ContextQADataset(examples, max_len=max_len)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True)
@@ -606,67 +741,191 @@ def train_phase_c(model, cfg, device, examples, steps=500, lr=1e-4,
 
 
 # ============================================================================
-# Phase D: Memory QA — direct float injection (no trie, no int8)
+# Phase D: Memory QA — streaming video-frame encoder
 # ============================================================================
 
-def encode_passages_to_memory(model, passages, device, n_slots=9):
+def _find_entity_positions(token_ids, pad_id):
     """
-    Encode passages → hidden states → sample positions as float memory vectors.
-    Bypasses trie/int8 entirely — direct teacher-forcing for training.
+    Parse passage tokens to find per-entity key positions.
+    Returns list of (name_pos, loc_pos, period_pos) tuples, one per entity.
+    Positions are offsets into the token_ids list (0-indexed).
+    """
+    name_ids = {VOCAB[n] for n in NAMES if n in VOCAB}
+    loc_ids = {VOCAB[l] for l in LOCATIONS if l in VOCAB}
+    period_id = VOCAB.get(".", -1)
 
-    passages: (B, T_passage) padded token IDs
-    Returns: (B, n_slots, d_model) float memory vectors
+    ids = [t for t in token_ids if t != pad_id]
+    entities = []
+    cur_name_pos = None
+    cur_loc_pos = None
+
+    for i, tid in enumerate(ids):
+        if tid in name_ids:
+            cur_name_pos = i
+            cur_loc_pos = None
+        elif tid in loc_ids and cur_name_pos is not None:
+            cur_loc_pos = i
+        elif tid == period_id and cur_name_pos is not None:
+            entities.append((
+                cur_name_pos,
+                cur_loc_pos if cur_loc_pos is not None else i,
+                i,  # period position
+            ))
+            cur_name_pos = None
+            cur_loc_pos = None
+
+    return entities
+
+
+
+def encode_streaming_memory(model, passages, device, chunk_size=8,
+                            slots_per_chunk=2, differentiable=False):
+    """Video-frame streaming encoder — per-token memory.
+
+    Processes passage chunks sequentially. Each chunk's forward pass includes
+    cross-attention to ALL previously emitted token hidden states, so each
+    new "frame" is encoded with full awareness of what came before.
+
+    Every content token becomes its own memory vector (no pooling).
+    This preserves per-token entity/location information that pooling destroys.
+
+    Returns: (keys, values, mask) -- memory bank for downstream QA.
+      keys:   (B, n_tokens, d_model) -- per-token hidden + temporal signal
+      values: (B, n_tokens, d_model) -- per-token hidden states
+      mask:   (B, n_tokens) bool     -- True for valid positions
     """
     B = passages.size(0)
-    d = model.cfg.d_model
+    d_model = model.cfg.d_model
     pad_id = VOCAB["<pad>"]
+    bos_id = VOCAB["<bos>"]
 
-    # Add BOS prefix for proper model input
-    bos = torch.full((B, 1), VOCAB["<bos>"], dtype=torch.long, device=device)
-    p_inp = torch.cat([bos, passages.to(device)], dim=1)  # (B, T+1)
-
-    with torch.no_grad():
-        _, _, p_hidden = model(p_inp, return_hidden=True)  # (B, T+1, d_model)
-
-    mem_vecs = torch.zeros(B, n_slots, d, device=device)
-
+    # Per-example content lengths (exclude padding)
+    content_lens = []
     for b in range(B):
-        # Find non-pad positions (skip BOS at 0)
-        p_ids = passages[b]
-        content_len = (p_ids != pad_id).sum().item()
-        if content_len == 0:
-            continue
+        clen = sum(1 for t in passages[b].tolist() if t != pad_id)
+        content_lens.append(clen)
 
-        # Sample evenly from content positions (offset +1 for BOS)
-        content_positions = list(range(1, content_len + 1))
-        if len(content_positions) >= n_slots:
-            step = len(content_positions) / n_slots
-            selected = [content_positions[int(i * step)] for i in range(n_slots)]
+    max_clen = max(content_lens) if content_lens else 0
+    if max_clen == 0:
+        empty = torch.zeros(B, 1, d_model, device=device)
+        empty_mask = torch.zeros(B, 1, dtype=torch.bool, device=device)
+        return empty, empty.clone(), empty_mask
+
+    n_chunks = (max_clen + chunk_size - 1) // chunk_size
+
+    # Accumulate per-token memory across chunks
+    all_keys = []    # list of (B, d_model) tensors, one per token
+    all_values = []
+    all_mask = []    # list of (B,) bool tensors
+
+    for ci in range(n_chunks):
+        start = ci * chunk_size
+        end = min(start + chunk_size, max_clen)
+        chunk_len = end - start
+
+        # Build chunk input: [BOS, chunk_tokens...] per example
+        inp = torch.full((B, chunk_len + 1), pad_id, dtype=torch.long, device=device)
+        per_token_valid = torch.zeros(B, chunk_len, dtype=torch.bool, device=device)
+
+        for b in range(B):
+            clen = content_lens[b]
+            if start >= clen:
+                continue
+            inp[b, 0] = bos_id
+            actual_end = min(end, clen)
+            actual_len = actual_end - start
+            inp[b, 1:actual_len + 1] = passages[b, start:actual_end]
+            per_token_valid[b, :actual_len] = True
+
+        # Prepare accumulated memory from previous chunks
+        if all_keys:
+            mem_keys = torch.stack(all_keys, dim=1)
+            mem_vals = torch.stack(all_values, dim=1)
+            mem_mask = torch.stack(all_mask, dim=1)
         else:
-            # Repeat positions to fill all slots
-            selected = content_positions * (n_slots // len(content_positions) + 1)
-            selected = selected[:n_slots]
+            mem_keys, mem_vals, mem_mask = None, None, None
 
-        for j, pos in enumerate(selected):
-            mem_vecs[b, j] = p_hidden[b, pos].detach()
+        # Forward pass — each chunk sees all previous tokens via cross-attention
+        if differentiable:
+            _, _, hidden = model(
+                inp, memory_keys=mem_keys, memory_values=mem_vals,
+                memory_mask=mem_mask, return_hidden=True)
+        else:
+            with torch.no_grad():
+                _, _, hidden = model(
+                    inp, memory_keys=mem_keys, memory_values=mem_vals,
+                    memory_mask=mem_mask, return_hidden=True)
 
-    return mem_vecs
+        # Skip BOS (position 0), keep per-token hidden states
+        content_h = hidden[:, 1:, :]  # (B, chunk_len, d_model)
+
+        # Temporal embedding for this chunk
+        t_idx = torch.tensor(ci, dtype=torch.long, device=device)
+        t_idx = t_idx.clamp_max(model.temporal_emb.num_embeddings - 1)
+        t_emb = model.temporal_emb(t_idx)  # (d_model,)
+
+        # Each token becomes its own memory entry
+        for ti in range(chunk_len):
+            tok_h = content_h[:, ti, :]       # (B, d_model)
+            tok_valid = per_token_valid[:, ti]  # (B,)
+            all_keys.append(tok_h + t_emb)
+            all_values.append(tok_h)
+            all_mask.append(tok_valid)
+
+    # Stack into memory bank tensors
+    keys = torch.stack(all_keys, dim=1)    # (B, n_tokens, d_model)
+    values = torch.stack(all_values, dim=1)
+    mask = torch.stack(all_mask, dim=1)
+
+    return keys, values, mask
+
+
+def encode_kv_memory_chunked(model, passages, device, chunk_size=8,
+                             slots_per_chunk=2, **kwargs):
+    """Non-differentiable streaming memory encoding."""
+    return encode_streaming_memory(
+        model, passages, device, chunk_size, slots_per_chunk,
+        differentiable=False)
+
+
+def encode_kv_memory_chunked_differentiable(model, passages, device,
+                                             chunk_size=8, slots_per_chunk=2,
+                                             **kwargs):
+    """Differentiable streaming memory encoding -- gradients flow through."""
+    return encode_streaming_memory(
+        model, passages, device, chunk_size, slots_per_chunk,
+        differentiable=True)
 
 
 def train_phase_d(model, cfg, device, train_examples, val_examples,
-                  memory_dir, steps=3000, lr=1e-4, batch_size=32,
+                  memory_dir, steps=3000, lr=1e-4, batch_size=16,
                   max_len=128, eval_interval=200):
     """
-    Memory-dependent QA with direct float injection.
-    Passage hidden states → memory vectors (no trie, no int8).
-    Curriculum: warmup with context+memory → memory-only.
+    Memory-dependent QA with video-frame streaming encoder.
+    Each passage is split into chunks, processed sequentially with
+    cross-attention to previously stored memory (cumulative encoding).
+
+    D1: context+memory with frozen encoding (warmup).
+    D2: memory-only with DIFFERENTIABLE encoding.
     """
     print("\n" + "=" * 60)
-    print("  Phase D: Memory QA (direct injection, no trie)")
+    print("  Phase D: Memory QA (streaming encoder, cross-attn)")
     print("=" * 60)
 
     d_model = cfg.d_model
-    n_mem_slots = 9
+    chunk_size = getattr(cfg, 'chunk_size', 8)
+    slots_per_chunk = getattr(cfg, 'slots_per_chunk', 2)
+    context_fade_start = int(steps * 0.2)
+
+    print(f"  Steps:          {steps}")
+    print(f"  Batch size:     {batch_size}")
+    print(f"  LR:             {lr}")
+    print(f"  D1 (frozen mem): steps 1-{context_fade_start}")
+    print(f"  D2 (diff mem):   steps {context_fade_start+1}-{steps}")
+    print(f"  Eval every:     {eval_interval} steps")
+    print(f"  Chunk size:     {chunk_size} tokens")
+    print(f"  Slots/chunk:    {slots_per_chunk}")
+    print(f"  d_model:        {d_model}")
 
     train_ds = MemoryQADataset(train_examples, max_len=max_len)
     val_ds = MemoryQADataset(val_examples, max_len=max_len)
@@ -678,13 +937,30 @@ def train_phase_d(model, cfg, device, train_examples, val_examples,
     loader_iter = iter(train_loader)
     t0 = time.time()
     best_acc = 0.0
+    best_step = 0
+    tracker = TrainingTracker(window=50)
 
-    # Curriculum phases:
-    # D1 (0-30%): passage in both context AND memory (learn to attend to mem)
-    # D2 (30-100%): memory only (force reliance on memory)
-    context_fade_start = int(steps * 0.3)
+    # Initial memory diagnostics
+    print("\n  Initial memory encoding diagnostics:")
+    sample_batch = next(iter(train_loader))
+    with torch.no_grad():
+        model.eval()
+        sample_keys, sample_vals, sample_mask = encode_kv_memory_chunked(
+            model, sample_batch[2].to(device), device, chunk_size, slots_per_chunk)
+        n_valid = sample_mask.sum(dim=1).float().mean().item()
+        print(f"  Avg valid slots: {n_valid:.1f} / {sample_keys.size(1)}")
+        log_memory_diagnostics(sample_keys, "  Init keys")
+        log_memory_diagnostics(sample_vals, "  Init vals")
+        model.train()
+    del sample_batch
+
+    print(f"\n  {'─' * 56}")
+    print(f"  Training started at {time.strftime('%H:%M:%S')}")
+    print(f"  {'─' * 56}")
 
     for step in range(1, steps + 1):
+        tracker.tick()
+
         try:
             inp, tgt, passages = next(loader_iter)
         except StopIteration:
@@ -697,63 +973,25 @@ def train_phase_d(model, cfg, device, train_examples, val_examples,
         for pg in optimizer.param_groups:
             pg["lr"] = lr_now
 
-        # Encode passages → float memory vectors (no trie)
-        model.eval()
-        mem_vecs = encode_passages_to_memory(model, passages, device, n_mem_slots)
-        model.train()
-
-        # D1: Use ContextQA format (passage in context) + memory vectors
-        # D2: Memory only (current inp already has no passage)
-        if step < context_fade_start:
-            # Build context+memory inputs: [BOS] passage [ANS] question answer [EOS]
-            # We need to rebuild inp with passage in context
-            ctx_inp_list, ctx_tgt_list = [], []
-            bos_id, ans_id, eos_id, pad_id = (
-                VOCAB["<bos>"], VOCAB["<ans>"], VOCAB["<eos>"], VOCAB["<pad>"]
-            )
-            for b in range(passages.size(0)):
-                p_ids = [x for x in passages[b].tolist() if x != pad_id]
-                # Extract question and answer from the memory-QA format inp/tgt
-                # inp format: [BOS] [ANS] question... [pad...]
-                # tgt format: [PAD] [PAD]... answer [EOS] [pad...]
-                inp_b = inp[b].tolist()
-                tgt_b = tgt[b].tolist()
-                # Find answer tokens (non-pad in tgt)
-                ans_tokens = [t for t in tgt_b if t != pad_id]
-                # Find question tokens (between ANS marker and padding in inp)
-                q_start = 2  # after BOS, ANS
-                q_end = q_start
-                while q_end < len(inp_b) and inp_b[q_end] != pad_id:
-                    q_end += 1
-                q_tokens = inp_b[q_start:q_end]
-
-                ctx_seq = [bos_id] + p_ids + [ans_id] + q_tokens + ans_tokens
-                ctx_inp = ctx_seq[:-1]
-                n_ctx = 1 + len(p_ids) + 1 + len(q_tokens)
-                ctx_tgt = [pad_id] * (n_ctx - 1) + ans_tokens
-                assert len(ctx_inp) == len(ctx_tgt), \
-                    f"len mismatch: {len(ctx_inp)} vs {len(ctx_tgt)}"
-
-                # Pad/truncate
-                if len(ctx_inp) > max_len:
-                    ctx_inp = ctx_inp[:max_len]
-                    ctx_tgt = ctx_tgt[:max_len]
-                while len(ctx_inp) < max_len:
-                    ctx_inp.append(pad_id)
-                    ctx_tgt.append(pad_id)
-
-                ctx_inp_list.append(ctx_inp)
-                ctx_tgt_list.append(ctx_tgt)
-
-            inp_d = torch.tensor(ctx_inp_list, dtype=torch.long, device=device)
-            tgt_d = torch.tensor(ctx_tgt_list, dtype=torch.long, device=device)
+        # D1: frozen encoding, memory-only (teaches reader to use memory)
+        # D2: differentiable encoding, memory-only (encoder + reader co-adapt)
+        if step >= context_fade_start:
+            mem_keys, mem_vals, mem_mask = encode_kv_memory_chunked_differentiable(
+                model, passages, device, chunk_size, slots_per_chunk)
         else:
-            inp_d = inp
-            tgt_d = tgt
+            model.eval()
+            mem_keys, mem_vals, mem_mask = encode_kv_memory_chunked(
+                model, passages, device, chunk_size, slots_per_chunk)
+            model.train()
 
-        # Forward with memory vectors
+        # Both D1 and D2: memory-only QA (no context passage in input)
+        inp_d = inp
+        tgt_d = tgt
+
+        # Forward
         logits, halt_logits, hidden = model(
-            inp_d, memory_vectors=mem_vecs, return_hidden=True
+            inp_d, memory_keys=mem_keys, memory_values=mem_vals,
+            memory_mask=mem_mask, return_hidden=True
         )
 
         loss = F.cross_entropy(
@@ -764,22 +1002,78 @@ def train_phase_d(model, cfg, device, train_examples, val_examples,
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+
+        # Track gradient norms
+        grad_norm, module_norms = log_gradient_stats(model)
+        tracker.add_grad_norm(grad_norm)
+        tracker.add_loss(loss.item())
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
-        if step % 50 == 0 or step == 1:
+        # ── Logging ──
+        if step % 25 == 0 or step == 1:
             elapsed = time.time() - t0
-            phase = "D1(ctx+mem)" if step < context_fade_start else "D2(mem-only)"
-            print(f"  [{phase} {step}/{steps}] loss={loss.item():.4f} "
-                  f"lr={lr_now:.2e} ({elapsed:.0f}s)")
+            eta = elapsed / step * (steps - step) if step > 0 else 0
+            phase_tag = "D1" if step < context_fade_start else "D2*"  # * = differentiable
+            trend = tracker.loss_trend
+
+            c_tag = ""
+            print(f"  [{phase_tag} {step:>5}/{steps}] "
+                  f"loss={loss.item():.4f} avg={tracker.avg_loss:.4f}{trend} "
+                  f"gnorm={grad_norm:.2f} "
+                  f"lr={lr_now:.1e} "
+                  f"spd={tracker.steps_per_sec:.1f}it/s "
+                  f"[{elapsed:.0f}s / ETA {eta:.0f}s]")
+
+        # Detailed diagnostics every 250 steps
+        if step % 250 == 0:
+            print(f"\n  ┌─── Diagnostics @ step {step} ───")
+            model.eval()
+            with torch.no_grad():
+                diag_keys, diag_vals, diag_mask = encode_kv_memory_chunked(
+                    model, passages[:4], device, chunk_size, slots_per_chunk)
+                n_valid = diag_mask[:4].sum(dim=1).float().mean().item()
+                print(f"  │ Valid slots: {n_valid:.1f}/{diag_keys.size(1)}")
+                log_memory_diagnostics(diag_keys, "  │ Keys")
+                log_memory_diagnostics(diag_vals, "  │ Vals")
+            model.train()
+            # Gradient breakdown
+            top_modules = sorted(module_norms.items(), key=lambda x: -x[1])[:5]
+            print(f"  │ Top grad modules: " +
+                  " ".join(f"{n}={v:.3f}" for n, v in top_modules))
+            # Loss statistics
+            print(f"  │ Loss: best={tracker.best_loss:.4f} "
+                  f"avg50={tracker.avg_loss:.4f} "
+                  f"last={loss.item():.4f}")
+            if tracker.eval_history:
+                last_step, last_acc, _ = tracker.eval_history[-1]
+                print(f"  │ Last eval: step={last_step} acc={last_acc:.1%} "
+                      f"best={tracker.best_acc:.1%}")
+            print(f"  └────────────────────\n")
 
         # Evaluation
         if step % eval_interval == 0 or step == steps:
-            acc = evaluate_memory_qa(model, cfg, val_examples, device,
-                                     max_examples=200)
-            print(f"  [D Eval @ {step}] Accuracy: {acc:.1%} (best: {best_acc:.1%})")
+            acc, breakdown = evaluate_memory_qa(
+                model, cfg, val_examples, device, max_examples=200,
+                return_breakdown=True)
+            tracker.add_eval(step, acc, breakdown)
+
+            # Show detailed eval results
+            delta = acc - tracker.eval_history[-2][1] if len(tracker.eval_history) > 1 else 0
+            delta_str = f" ({'+' if delta >= 0 else ''}{delta:.1%})" if len(tracker.eval_history) > 1 else ""
+            print(f"\n  ╔══ EVAL @ step {step} ══")
+            print(f"  ║ Accuracy: {acc:.1%}{delta_str}  (best: {tracker.best_acc:.1%})")
+            if breakdown:
+                for n_facts, (corr, tot) in sorted(breakdown.items()):
+                    bar = "█" * int(corr / max(tot, 1) * 20)
+                    print(f"  ║   {n_facts}-fact: {corr:>3}/{tot:>3} = "
+                          f"{corr/max(tot,1):.1%} {bar}")
+            print(f"  ╚{'═' * 30}\n")
+
             if acc > best_acc:
                 best_acc = acc
+                best_step = step
                 save_path = os.path.join(memory_dir, "best_model.pt")
                 torch.save({
                     "model": model.state_dict(),
@@ -788,6 +1082,15 @@ def train_phase_d(model, cfg, device, train_examples, val_examples,
                     "vocab": VOCAB,
                 }, save_path)
                 print(f"  ✓ New best! Saved to {save_path}")
+
+            # Early stopping: no improvement for 5 evals (1000 steps)
+            if step > context_fade_start and step - best_step >= eval_interval * 5:
+                print(f"\n  ⚠ Early stopping at step {step} (no improvement since step {best_step})")
+                # Reload best model
+                ckpt = torch.load(os.path.join(memory_dir, "best_model.pt"),
+                                  map_location=device, weights_only=True)
+                model.load_state_dict(ckpt["model"])
+                break
 
     elapsed = time.time() - t0
     print(f"  Phase D done in {elapsed:.0f}s, best accuracy={best_acc:.1%}")
@@ -799,14 +1102,16 @@ def train_phase_d(model, cfg, device, train_examples, val_examples,
 # ============================================================================
 
 @torch.no_grad()
-def evaluate_memory_qa(model, cfg, examples, device, max_examples=200):
+def evaluate_memory_qa(model, cfg, examples, device, max_examples=200,
+                       return_breakdown=False):
     """
-    Evaluate memory recall with direct float injection (no trie).
-    For each example: encode passage → hidden states → memory vectors → predict.
+    Evaluate memory recall with streaming video-frame encoding.
+    For each example: encode passage chunks → memory → predict.
     """
     model.eval()
     d_model = cfg.d_model
-    n_mem_slots = 9
+    chunk_size = getattr(cfg, 'chunk_size', 8)
+    slots_per_chunk = getattr(cfg, 'slots_per_chunk', 2)
     pad_id = VOCAB["<pad>"]
 
     correct = 0
@@ -817,35 +1122,19 @@ def evaluate_memory_qa(model, cfg, examples, device, max_examples=200):
     for i, ex in enumerate(examples[:max_examples]):
         passage_ids = tokenize(ex.passage)
 
-        # Encode passage → memory vectors
-        p_inp = torch.tensor([[VOCAB["<bos>"]] + passage_ids],
-                              dtype=torch.long, device=device)
-        _, _, p_hidden = model(p_inp, return_hidden=True)
-
-        # Sample positions from passage hidden states
-        content_len = len(passage_ids)
-        if content_len == 0:
-            mem_vecs = torch.zeros(1, n_mem_slots, d_model, device=device)
-        else:
-            positions = list(range(1, content_len + 1))
-            if len(positions) >= n_mem_slots:
-                step = len(positions) / n_mem_slots
-                selected = [positions[int(j * step)] for j in range(n_mem_slots)]
-            else:
-                selected = positions * (n_mem_slots // len(positions) + 1)
-                selected = selected[:n_mem_slots]
-            mem_vecs = torch.stack(
-                [p_hidden[0, pos] for pos in selected]
-            ).unsqueeze(0)  # (1, n_mem_slots, d_model)
+        p_tensor = torch.tensor([passage_ids], dtype=torch.long, device=device)
+        mem_keys, mem_vals, mem_mask = encode_kv_memory_chunked(
+            model, p_tensor, device, chunk_size, slots_per_chunk)
 
         # Build question input
         question_ids = tokenize(ex.question)
         inp_ids = [VOCAB["<bos>"], VOCAB["<ans>"]] + question_ids
         inp = torch.tensor([inp_ids], dtype=torch.long, device=device)
 
-        # Forward with memory
-        logits, halt_logits, _ = model(inp, memory_vectors=mem_vecs,
-                                        return_hidden=True)
+        logits, _, hidden = model(inp, memory_keys=mem_keys,
+                                   memory_values=mem_vals,
+                                   memory_mask=mem_mask,
+                                   return_hidden=True)
 
         pred_id = logits[0, -1, :].argmax().item()
         expected_id = VOCAB.get(ex.answer, -1)
@@ -868,6 +1157,10 @@ def evaluate_memory_qa(model, cfg, examples, device, max_examples=200):
         print(f"    {n_facts}-fact: {t_corr}/{t_tot} = {t_corr/max(t_tot,1):.1%}")
 
     model.train()
+
+    if return_breakdown:
+        breakdown = {k: (type_correct[k], type_total[k]) for k in type_total}
+        return accuracy, breakdown
     return accuracy
 
 
@@ -901,10 +1194,11 @@ def evaluate_context_qa(model, cfg, examples, device, max_examples=200):
 
 
 def detailed_eval(model, cfg, examples, device, n=10):
-    """Print detailed examples with direct float injection."""
+    """Print detailed examples with streaming memory."""
     model.eval()
     d_model = cfg.d_model
-    n_mem_slots = 9
+    chunk_size = getattr(cfg, 'chunk_size', 8)
+    slots_per_chunk = getattr(cfg, 'slots_per_chunk', 2)
     print("\n" + "-" * 60)
     print("  Detailed Examples")
     print("-" * 60)
@@ -912,27 +1206,10 @@ def detailed_eval(model, cfg, examples, device, n=10):
     for i, ex in enumerate(examples[:n]):
         passage_ids = tokenize(ex.passage)
 
-        # Encode passage → memory vectors
-        p_inp = torch.tensor([[VOCAB["<bos>"]] + passage_ids],
-                              dtype=torch.long, device=device)
-
+        p_tensor = torch.tensor([passage_ids], dtype=torch.long, device=device)
         with torch.no_grad():
-            _, _, p_hidden = model(p_inp, return_hidden=True)
-
-        content_len = len(passage_ids)
-        if content_len == 0:
-            mem_vecs = torch.zeros(1, n_mem_slots, d_model, device=device)
-        else:
-            positions = list(range(1, content_len + 1))
-            if len(positions) >= n_mem_slots:
-                step = len(positions) / n_mem_slots
-                selected = [positions[int(j * step)] for j in range(n_mem_slots)]
-            else:
-                selected = positions * (n_mem_slots // len(positions) + 1)
-                selected = selected[:n_mem_slots]
-            mem_vecs = torch.stack(
-                [p_hidden[0, pos] for pos in selected]
-            ).unsqueeze(0)
+            mem_keys, mem_vals, mem_mask = encode_kv_memory_chunked(
+                model, p_tensor, device, chunk_size, slots_per_chunk)
 
         # Question input
         question_ids = tokenize(ex.question)
@@ -940,9 +1217,12 @@ def detailed_eval(model, cfg, examples, device, n=10):
         inp = torch.tensor([inp_ids], dtype=torch.long, device=device)
 
         with torch.no_grad():
-            # With memory
-            logits_mem, halt_logits, _ = model(
-                inp, memory_vectors=mem_vecs, return_hidden=True)
+            logits_mem, _, hidden = model(inp, memory_keys=mem_keys,
+                                           memory_values=mem_vals,
+                                           memory_mask=mem_mask,
+                                           return_hidden=True)
+            n_valid = mem_mask[0].sum().item()
+            avg_norm = mem_keys[0, :n_valid].norm(dim=-1).mean().item() if n_valid > 0 else 0.0
             # Without memory
             logits_no_mem, _ = model(inp)
 
@@ -955,12 +1235,6 @@ def detailed_eval(model, cfg, examples, device, n=10):
         top5_words = [(ID2WORD.get(idx.item(), "?"), f"{p.item():.3f}")
                       for idx, p in zip(top5_ids, top5_probs)]
 
-        halt_prob = F.softmax(halt_logits[0, -1, :], dim=-1)[1].item()
-
-        # Mem vector norms
-        mem_norms = mem_vecs[0].norm(dim=-1)
-        avg_norm = mem_norms.mean().item()
-
         expected = ex.answer
         mark = "✓" if ID2WORD.get(pred_mem, "") == expected else "✗"
 
@@ -971,7 +1245,7 @@ def detailed_eval(model, cfg, examples, device, n=10):
         print(f"    With mem: {ID2WORD.get(pred_mem, '?')} | "
               f"No mem: {ID2WORD.get(pred_no_mem, '?')}")
         print(f"    Top-5:    {top5_words}")
-        print(f"    P(halt):  {halt_prob:.3f} | Mem norm: {avg_norm:.2f}")
+        print(f"    Mem: {n_valid} slots, avg_norm={avg_norm:.2f}")
 
     model.train()
 
@@ -1020,14 +1294,10 @@ def main():
     cfg.vocab_size = VOCAB_SIZE  # override with actual vocab size
     print(f"  Device:     {device}")
     print(f"  Vocab:      {VOCAB_SIZE} words")
-    print(f"  d_model:    {cfg.d_model}")
-    print(f"  n_layers:   {cfg.n_layers}")
-    print(f"  n_heads:    {cfg.n_heads}")
-    print(f"  max_seq:    {cfg.max_seq_len}")
 
     model = LoopedLatentController(cfg, use_checkpoint=False).to(device)
     n_params = count_params(model)
-    print(f"  Parameters: {n_params:,} ({n_params/1e6:.2f}M)")
+    log_model_summary(model, cfg)
 
     # Generate data
     print(f"\n  Generating {args.n_train} train + {args.n_val} val examples...")
@@ -1071,6 +1341,10 @@ def main():
 
     # ===== Full Training Pipeline =====
     t_start = time.time()
+    print("\n" + "─" * 60)
+    print(f"  Pipeline: A({args.phase_a_steps}) → B({args.phase_b_steps}) "
+          f"→ C({args.phase_c_steps}) → D({args.phase_d_steps})")
+    print("─" * 60)
 
     # Phase A: Warmup LM
     loss_a = train_phase_a(model, cfg, device, train_examples,
@@ -1094,8 +1368,14 @@ def main():
     ctx_acc_c = evaluate_context_qa(model, cfg, val_examples, device)
     print(f"  → {ctx_acc_c:.1%}")
 
+    # Memory QA baseline (before Phase D)
+    print("\n  Memory QA BEFORE Phase D (random baseline):")
+    pre_d_acc = evaluate_memory_qa(model, cfg, val_examples, device, max_examples=200)
+    print(f"  → {pre_d_acc:.1%}")
+
     # Phase D: Memory QA (the real test)
     mem_dir = os.path.join(args.output_dir, "memory")
+    os.makedirs(mem_dir, exist_ok=True)
     best_acc = train_phase_d(
         model, cfg, device, train_examples, val_examples, mem_dir,
         steps=args.phase_d_steps, lr=1e-4, batch_size=32,

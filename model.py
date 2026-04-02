@@ -123,6 +123,51 @@ class Attention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Memory Cross-Attention
+# ---------------------------------------------------------------------------
+
+class MemoryAttention(nn.Module):
+    """Cross-attention to external key-value memory.
+
+    Full Q/K/V/O projections so each head can specialize in reading
+    different aspects of memory (entity names, locations, relations, etc.).
+    """
+    def __init__(self, d_model: int, n_heads: int, head_dim: int):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = head_dim
+        inner = n_heads * head_dim
+
+        self.q = nn.Linear(d_model, inner, bias=False)
+        self.k = nn.Linear(d_model, inner, bias=False)
+        self.v = nn.Linear(d_model, inner, bias=False)
+        self.o = nn.Linear(inner, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor, mem_keys: torch.Tensor,
+                mem_values: torch.Tensor,
+                mem_mask: torch.Tensor | None = None) -> torch.Tensor:
+        B, T, _ = x.shape
+        S = mem_keys.shape[1]
+        H, D = self.n_heads, self.head_dim
+
+        q = self.q(x).view(B, T, H, D).transpose(1, 2)          # (B, H, T, D)
+        k = self.k(mem_keys).view(B, S, H, D).transpose(1, 2)   # (B, H, S, D)
+        v = self.v(mem_values).view(B, S, H, D).transpose(1, 2)  # (B, H, S, D)
+
+        attn_mask = None
+        if mem_mask is not None:
+            attn_mask = torch.zeros(B, 1, 1, S, device=x.device, dtype=x.dtype)
+            attn_mask.masked_fill_(~mem_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
+        out = out.transpose(1, 2).reshape(B, T, H * D)
+        return self.o(out)
+
+
+
+
+
+# ---------------------------------------------------------------------------
 # Transformer Block
 # ---------------------------------------------------------------------------
 
@@ -131,6 +176,14 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.norm1 = RMSNorm(cfg.d_model)
         self.attn  = Attention(cfg)
+
+        self.use_mem_attn = getattr(cfg, 'use_memory_cross_attention', False)
+        if self.use_mem_attn:
+            self.norm_mem = RMSNorm(cfg.d_model)
+            self.mem_attn = MemoryAttention(
+                cfg.d_model, cfg.n_heads, cfg.head_dim
+            )
+
         self.norm2 = RMSNorm(cfg.d_model)
         self.ffn   = SiLUFFN(cfg.d_model, cfg.ffn_dim)
         self.drop  = nn.Dropout(cfg.dropout)
@@ -142,9 +195,17 @@ class TransformerBlock(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         kv_cache: tuple | None = None,
+        mem_keys: torch.Tensor | None = None,
+        mem_values: torch.Tensor | None = None,
+        mem_mask: torch.Tensor | None = None,
     ) -> tuple:
         attn_out, new_cache = self.attn(self.norm1(x), mask, cos, sin, kv_cache)
         x = x + self.drop(attn_out)
+
+        if self.use_mem_attn and mem_keys is not None:
+            x = x + self.drop(self.mem_attn(
+                self.norm_mem(x), mem_keys, mem_values, mem_mask))
+
         x = x + self.drop(self.ffn(self.norm2(x)))
         return x, new_cache
 
@@ -172,6 +233,11 @@ class LoopedLatentController(nn.Module):
             nn.Linear(cfg.d_model, cfg.addr_dim, bias=False)
             for _ in range(cfg.n_addr_heads)
         ])
+
+        # Temporal embedding for memory slots (chunk ordering)
+        if getattr(cfg, 'use_memory_cross_attention', False):
+            max_temporal = getattr(cfg, 'max_temporal_chunks', 32)
+            self.temporal_emb = nn.Embedding(max_temporal, cfg.d_model)
 
         # RoPE cache (full context: mem + text — must cover max possible sequence)
         total_pos = cfg.n_mem_positions + cfg.max_seq_len
@@ -250,34 +316,52 @@ class LoopedLatentController(nn.Module):
         self,
         token_ids: torch.Tensor,
         memory_vectors: torch.Tensor | None = None,
+        memory_keys: torch.Tensor | None = None,
+        memory_values: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
         return_hidden: bool = False,
         kv_cache: list | None = None,
         cache_position: int = 0,
+        bidirectional: bool = False,
     ):
         """
         token_ids      : (B, T_text)
-        memory_vectors : (B, n_mem, d_model) float — raw 512-dim embeddings
+        memory_vectors : (B, n_mem, d_model) float — raw embeddings (legacy)
+        memory_keys    : (B, n_mem, inner) — pre-computed keys from write heads
+        memory_values  : (B, n_mem, inner) — pre-computed values from write heads
+        memory_mask    : (B, n_mem) bool — True for valid memory slots
         kv_cache       : list of (k, v) tuples per layer, or None
         cache_position : position offset for RoPE when using KV-cache
+        bidirectional  : if True, use full (non-causal) self-attention mask.
+                         Use during memory encoding so all tokens see each other.
         Returns (logits, halt_logits[, hidden][, new_kv_cache]).
         When kv_cache is not None, returns new_kv_cache as last element.
         logits cover text positions only.
         """
         B, T_text = token_ids.shape
         device = token_ids.device
+        use_cross_attn = getattr(self.cfg, 'use_memory_cross_attention', False)
 
         x = self.embed(token_ids)   # (B, T_text, d_model)
 
+        # Memory handling: cross-attention mode vs prepend mode
         n_mem = 0
-        if memory_vectors is not None:
-            n_mem = memory_vectors.shape[1] + 2  # +2 for <MEM> and </MEM> tokens
-            mem_start = self.embed(
-                torch.full((B, 1), self.cfg.mem_start_id, dtype=torch.long, device=device)
-            )
-            mem_end = self.embed(
-                torch.full((B, 1), self.cfg.mem_end_id, dtype=torch.long, device=device)
-            )
-            x = torch.cat([mem_start, memory_vectors, mem_end, x], dim=1)
+        cross_keys = None
+        cross_vals = None
+        cross_mask = memory_mask  # (B, S) bool or None
+        if use_cross_attn:
+            if memory_keys is not None and memory_values is not None:
+                cross_keys, cross_vals = memory_keys, memory_values
+        elif memory_vectors is not None:
+                # Legacy prepend: [<MEM> mem1..N </MEM> text]
+                n_mem = memory_vectors.shape[1] + 2
+                mem_start = self.embed(
+                    torch.full((B, 1), self.cfg.mem_start_id, dtype=torch.long, device=device)
+                )
+                mem_end = self.embed(
+                    torch.full((B, 1), self.cfg.mem_end_id, dtype=torch.long, device=device)
+                )
+                x = torch.cat([mem_start, memory_vectors, mem_end, x], dim=1)
 
         T_new = x.shape[1]  # tokens being processed this call
 
@@ -286,20 +370,20 @@ class LoopedLatentController(nn.Module):
         is_incremental = kv_cache is not None and cache_position > 0
 
         if is_incremental:
-            # Incremental decoding: only process new token(s)
             cos = self.rope_cos[cache_position:cache_position + T_new]
             sin = self.rope_sin[cache_position:cache_position + T_new]
             T_total = cache_position + T_new
-            # New text tokens attend to all cached positions + themselves causally
             mask = torch.zeros(T_new, T_total, device=device)
             for i in range(T_new):
                 pos = cache_position + i
                 mask[i, pos + 1:] = -1e9
         else:
-            # Full context processing (training, or prefill for cache)
             cos = self.rope_cos[:T_new]
             sin = self.rope_sin[:T_new]
-            if n_mem == 0:
+            if bidirectional:
+                # Full attention: all tokens see all others (for encoding)
+                mask = torch.zeros(T_new, T_new, device=device)
+            elif n_mem == 0:
                 mask = self.text_only_mask[:T_text, :T_text]
             else:
                 mask = self.mem_text_mask[:T_new, :T_new]
@@ -308,16 +392,19 @@ class LoopedLatentController(nn.Module):
         for i, layer in enumerate(self.layers):
             layer_cache = kv_cache[i] if kv_cache is not None and i < len(kv_cache) else None
             if self.use_checkpoint and self.training:
-                # Gradient checkpointing (training only, no KV-cache)
-                x, _ = checkpoint(layer, x, mask, cos, sin, use_reentrant=False)
+                x, _ = checkpoint(layer, x, mask, cos, sin, None,
+                                  cross_keys, cross_vals, cross_mask,
+                                  use_reentrant=False)
                 new_kv_cache.append(None)
             else:
-                x, layer_kv = layer(x, mask, cos, sin, kv_cache=layer_cache)
+                x, layer_kv = layer(x, mask, cos, sin, kv_cache=layer_cache,
+                                    mem_keys=cross_keys, mem_values=cross_vals,
+                                    mem_mask=cross_mask)
                 new_kv_cache.append(layer_kv)
 
         hidden = self.norm(x)
 
-        # Text positions only
+        # Text positions only (n_mem=0 in cross-attention mode)
         text_hidden = hidden[:, n_mem:, :]              # (B, T_text, d_model)
 
         logits = F.linear(text_hidden, self.embed.weight)
@@ -351,7 +438,7 @@ class LoopedLatentController(nn.Module):
             addresses.append(addr)
         return addresses
 
-    def compute_addresses_batch(self, hidden_states: torch.Tensor):
+def compute_addresses_batch(self, hidden_states: torch.Tensor):
         """
         Vectorized address computation for a batch.
         hidden_states : (B, d_model)
