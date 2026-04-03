@@ -131,6 +131,9 @@ class MemoryAttention(nn.Module):
 
     Full Q/K/V/O projections so each head can specialize in reading
     different aspects of memory (entity names, locations, relations, etc.).
+
+    Includes a learnable inverse-temperature per head for sharper attention
+    when entity discrimination is needed.
     """
     def __init__(self, d_model: int, n_heads: int, head_dim: int):
         super().__init__()
@@ -143,6 +146,9 @@ class MemoryAttention(nn.Module):
         self.v = nn.Linear(d_model, inner, bias=False)
         self.o = nn.Linear(inner, d_model, bias=False)
 
+        # Per-head learnable inverse temperature (init=1.0, can sharpen)
+        self.inv_temp = nn.Parameter(torch.ones(n_heads))
+
     def forward(self, x: torch.Tensor, mem_keys: torch.Tensor,
                 mem_values: torch.Tensor,
                 mem_mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -153,6 +159,10 @@ class MemoryAttention(nn.Module):
         q = self.q(x).view(B, T, H, D).transpose(1, 2)          # (B, H, T, D)
         k = self.k(mem_keys).view(B, S, H, D).transpose(1, 2)   # (B, H, S, D)
         v = self.v(mem_values).view(B, S, H, D).transpose(1, 2)  # (B, H, S, D)
+
+        # Apply per-head temperature scaling to queries
+        temp = self.inv_temp.view(1, H, 1, 1)  # (1, H, 1, 1)
+        q = q * temp
 
         attn_mask = None
         if mem_mask is not None:

@@ -880,6 +880,90 @@ def encode_streaming_memory(model, passages, device, chunk_size=8,
     return keys, values, mask
 
 
+# ---------------------------------------------------------------------------
+# Encoder-Decoder Memory: Multi-iteration bidirectional encoder
+# ---------------------------------------------------------------------------
+
+def encode_enc_dec(model, passages, device, n_iterations=3,
+                   differentiable=False):
+    """Encoder-decoder memory: multi-iteration bidirectional encoder.
+
+    Two-phase architecture:
+      ENCODER: Processes the full passage with bidirectional self-attention
+               across multiple iterations. Each iteration cross-attends to
+               the previous iteration's output, enabling iterative refinement.
+               No token output — pure understanding.
+      DECODER: (handled by normal model.forward) Cross-attends to encoder
+               output via memory, produces answer tokens with causal attention.
+
+    Key insight: memory KEYS use raw token embeddings (entity identity),
+    while memory VALUES use refined contextual hidden states (understanding).
+    This separates "what to attend to" (entity matching) from
+    "what to retrieve" (contextual answer), solving the entity-routing problem.
+
+    Returns: (keys, values, mask) for decoder cross-attention.
+      keys:   (B, n_tokens, d_model) -- raw embeddings (identity-focused)
+      values: (B, n_tokens, d_model) -- refined hidden states (context-focused)
+      mask:   (B, n_tokens) bool     -- True for valid positions
+    """
+    B = passages.size(0)
+    d_model = model.cfg.d_model
+    pad_id = VOCAB["<pad>"]
+    bos_id = VOCAB["<bos>"]
+
+    # Per-example content lengths
+    content_lens = []
+    for b in range(B):
+        clen = sum(1 for t in passages[b].tolist() if t != pad_id)
+        content_lens.append(clen)
+
+    max_clen = max(content_lens) if content_lens else 0
+    if max_clen == 0:
+        empty = torch.zeros(B, 1, d_model, device=device)
+        empty_mask = torch.zeros(B, 1, dtype=torch.bool, device=device)
+        return empty, empty.clone(), empty_mask
+
+    # Build full passage input: [BOS, passage_tokens...]
+    inp = torch.full((B, max_clen + 1), pad_id, dtype=torch.long, device=device)
+    token_valid = torch.zeros(B, max_clen, dtype=torch.bool, device=device)
+    for b in range(B):
+        clen = content_lens[b]
+        inp[b, 0] = bos_id
+        inp[b, 1:clen + 1] = passages[b, :clen]
+        token_valid[b, :clen] = True
+
+    # Raw token embeddings for memory KEYS (entity identity, no context mixing)
+    with torch.no_grad():
+        raw_emb = model.embed(inp[:, 1:])  # (B, max_clen, d_model), skip BOS
+
+    # Multi-iteration bidirectional encoding for memory VALUES
+    mem_keys_iter, mem_vals_iter, mem_mask = None, None, None
+
+    ctx = torch.enable_grad if differentiable else torch.no_grad
+    with ctx():
+        for iteration in range(n_iterations):
+            # Full forward: bidirectional self-attn + cross-attn to prev iteration
+            _, _, hidden = model(
+                inp,
+                memory_keys=mem_keys_iter,
+                memory_values=mem_vals_iter,
+                memory_mask=mem_mask,
+                return_hidden=True,
+                bidirectional=True,
+            )
+
+            # Skip BOS, take per-token content hidden states
+            content_h = hidden[:, 1:, :]  # (B, max_clen, d_model)
+
+            # This iteration's output becomes next iteration's cross-attn target
+            mem_keys_iter = content_h
+            mem_vals_iter = content_h
+            mem_mask = token_valid
+
+    # Keys = raw embeddings (identity), Values = refined hidden (context)
+    return raw_emb, content_h, token_valid
+
+
 def encode_kv_memory_chunked(model, passages, device, chunk_size=8,
                              slots_per_chunk=2, **kwargs):
     """Non-differentiable streaming memory encoding."""
@@ -897,19 +981,177 @@ def encode_kv_memory_chunked_differentiable(model, passages, device,
         differentiable=True)
 
 
+# ---------------------------------------------------------------------------
+# Sentence-boundary streaming encoder
+# ---------------------------------------------------------------------------
+
+def encode_sentence_memory(model, passages, device, differentiable=False):
+    """Sentence-boundary streaming encoder — per-token memory.
+
+    Like the video-frame streaming encoder, but splits at sentence boundaries
+    (period tokens) instead of fixed chunk sizes. This guarantees each chunk
+    contains exactly one entity-location fact, preventing the boundary-splitting
+    problem that caps accuracy at 73%.
+
+    Each chunk's forward pass includes cross-attention to ALL previously
+    emitted token hidden states (streaming awareness).
+
+    Returns: (keys, values, mask) -- memory bank for downstream QA.
+    """
+    B = passages.size(0)
+    d_model = model.cfg.d_model
+    pad_id = VOCAB["<pad>"]
+    bos_id = VOCAB["<bos>"]
+    period_id = VOCAB["."]
+
+    # Per-example: find sentence boundaries and content lengths
+    example_sentences = []  # list of lists of (start, end) per example
+    content_lens = []
+    for b in range(B):
+        tokens = passages[b].tolist()
+        clen = sum(1 for t in tokens if t != pad_id)
+        content_lens.append(clen)
+
+        # Split at periods
+        sents = []
+        sent_start = 0
+        for i in range(clen):
+            if tokens[i] == period_id:
+                sents.append((sent_start, i + 1))  # include period
+                sent_start = i + 1
+        # Trailing tokens without period
+        if sent_start < clen:
+            sents.append((sent_start, clen))
+        example_sentences.append(sents)
+
+    max_clen = max(content_lens) if content_lens else 0
+    if max_clen == 0:
+        empty = torch.zeros(B, 1, d_model, device=device)
+        empty_mask = torch.zeros(B, 1, dtype=torch.bool, device=device)
+        return empty, empty.clone(), empty_mask
+
+    max_n_sents = max(len(s) for s in example_sentences)
+
+    # Accumulate per-token memory across sentences
+    all_keys = []
+    all_values = []
+    all_mask = []
+
+    for si in range(max_n_sents):
+        # Find max sentence length for this sentence index
+        sent_lens = []
+        for b in range(B):
+            if si < len(example_sentences[b]):
+                s, e = example_sentences[b][si]
+                sent_lens.append(e - s)
+            else:
+                sent_lens.append(0)
+        max_slen = max(sent_lens) if sent_lens else 0
+        if max_slen == 0:
+            continue
+
+        # Build sentence input: [BOS, sentence_tokens...]
+        inp = torch.full((B, max_slen + 1), pad_id, dtype=torch.long, device=device)
+        per_token_valid = torch.zeros(B, max_slen, dtype=torch.bool, device=device)
+
+        for b in range(B):
+            if si >= len(example_sentences[b]):
+                continue
+            s, e = example_sentences[b][si]
+            slen = e - s
+            inp[b, 0] = bos_id
+            inp[b, 1:slen + 1] = passages[b, s:e]
+            per_token_valid[b, :slen] = True
+
+        # Prepare accumulated memory from previous sentences
+        if all_keys:
+            mem_keys = torch.stack(all_keys, dim=1)
+            mem_vals = torch.stack(all_values, dim=1)
+            mem_mask_prev = torch.stack(all_mask, dim=1)
+        else:
+            mem_keys, mem_vals, mem_mask_prev = None, None, None
+
+        # Forward pass — causal within sentence, cross-attn to prev sentences
+        if differentiable:
+            _, _, hidden = model(
+                inp, memory_keys=mem_keys, memory_values=mem_vals,
+                memory_mask=mem_mask_prev, return_hidden=True)
+        else:
+            with torch.no_grad():
+                _, _, hidden = model(
+                    inp, memory_keys=mem_keys, memory_values=mem_vals,
+                    memory_mask=mem_mask_prev, return_hidden=True)
+
+        # Skip BOS, keep per-token hidden states
+        content_h = hidden[:, 1:, :]  # (B, max_slen, d_model)
+
+        # Temporal embedding for this sentence index
+        t_idx = torch.tensor(si, dtype=torch.long, device=device)
+        t_idx = t_idx.clamp_max(model.temporal_emb.num_embeddings - 1)
+        t_emb = model.temporal_emb(t_idx)
+
+        # Pool: last valid token per example as single memory slot per sentence
+        pooled_h = torch.zeros(B, d_model, device=device)
+        sent_valid = torch.zeros(B, dtype=torch.bool, device=device)
+        for b in range(B):
+            if si >= len(example_sentences[b]):
+                continue
+            slen = example_sentences[b][si][1] - example_sentences[b][si][0]
+            pooled_h[b] = content_h[b, slen - 1, :]
+            sent_valid[b] = True
+        all_keys.append(pooled_h + t_emb)
+        all_values.append(pooled_h)
+        all_mask.append(sent_valid)
+
+    # Stack into memory bank tensors
+    keys = torch.stack(all_keys, dim=1)
+    values = torch.stack(all_values, dim=1)
+    mask = torch.stack(all_mask, dim=1)
+
+    return keys, values, mask
+
+
+def encode_sentence_frozen(model, passages, device, **kwargs):
+    """Non-differentiable sentence-boundary memory encoding."""
+    return encode_sentence_memory(model, passages, device, differentiable=False)
+
+
+def encode_sentence_differentiable(model, passages, device, **kwargs):
+    """Differentiable sentence-boundary memory encoding."""
+    return encode_sentence_memory(model, passages, device, differentiable=True)
+
+
+def encode_enc_dec_frozen(model, passages, device, **kwargs):
+    """Non-differentiable encoder-decoder memory."""
+    return encode_enc_dec(model, passages, device, n_iterations=3,
+                          differentiable=False)
+
+
+def encode_enc_dec_differentiable(model, passages, device, **kwargs):
+    """Differentiable encoder-decoder memory — gradients flow through all iterations."""
+    return encode_enc_dec(model, passages, device, n_iterations=3,
+                          differentiable=True)
+
+
 def train_phase_d(model, cfg, device, train_examples, val_examples,
                   memory_dir, steps=3000, lr=1e-4, batch_size=16,
-                  max_len=128, eval_interval=200):
+                  max_len=128, eval_interval=200, encoder_mode='enc_dec'):
     """
-    Memory-dependent QA with video-frame streaming encoder.
-    Each passage is split into chunks, processed sequentially with
-    cross-attention to previously stored memory (cumulative encoding).
+    Memory-dependent QA with encoder-decoder architecture.
 
-    D1: context+memory with frozen encoding (warmup).
-    D2: memory-only with DIFFERENTIABLE encoding.
+    encoder_mode='enc_dec': Multi-iteration bidirectional encoder (default).
+      The encoder completely consumes the passage through 3 iterations of
+      bidirectional self-attention + cross-attention to previous iteration.
+      No token output during encoding — pure understanding.
+      The decoder then reads from encoder memory via cross-attention.
+
+    encoder_mode='streaming': Legacy streaming chunk encoder (single-pass).
+
+    D1: frozen encoding (teaches decoder to use memory)
+    D2: differentiable encoding (encoder + decoder co-adapt)
     """
     print("\n" + "=" * 60)
-    print("  Phase D: Memory QA (streaming encoder, cross-attn)")
+    print(f"  Phase D: Memory QA (encoder={encoder_mode})")
     print("=" * 60)
 
     d_model = cfg.d_model
@@ -917,14 +1159,29 @@ def train_phase_d(model, cfg, device, train_examples, val_examples,
     slots_per_chunk = getattr(cfg, 'slots_per_chunk', 2)
     context_fade_start = int(steps * 0.2)
 
+    # Select encoder functions based on mode
+    if encoder_mode == 'enc_dec':
+        encode_frozen = encode_enc_dec_frozen
+        encode_diff = encode_enc_dec_differentiable
+        enc_label = "enc-dec (3-iter bidir)"
+    elif encoder_mode == 'sentence':
+        encode_frozen = encode_sentence_frozen
+        encode_diff = encode_sentence_differentiable
+        enc_label = "sentence-boundary (bidir per sentence)"
+    else:
+        encode_frozen = lambda m, p, d, **kw: encode_kv_memory_chunked(
+            m, p, d, chunk_size, slots_per_chunk)
+        encode_diff = lambda m, p, d, **kw: encode_kv_memory_chunked_differentiable(
+            m, p, d, chunk_size, slots_per_chunk)
+        enc_label = f"streaming (chunk={chunk_size})"
+
     print(f"  Steps:          {steps}")
     print(f"  Batch size:     {batch_size}")
     print(f"  LR:             {lr}")
-    print(f"  D1 (frozen mem): steps 1-{context_fade_start}")
-    print(f"  D2 (diff mem):   steps {context_fade_start+1}-{steps}")
+    print(f"  D1 (frozen):    steps 1-{context_fade_start}")
+    print(f"  D2 (diff):      steps {context_fade_start+1}-{steps}")
     print(f"  Eval every:     {eval_interval} steps")
-    print(f"  Chunk size:     {chunk_size} tokens")
-    print(f"  Slots/chunk:    {slots_per_chunk}")
+    print(f"  Encoder:        {enc_label}")
     print(f"  d_model:        {d_model}")
 
     train_ds = MemoryQADataset(train_examples, max_len=max_len)
@@ -945,8 +1202,8 @@ def train_phase_d(model, cfg, device, train_examples, val_examples,
     sample_batch = next(iter(train_loader))
     with torch.no_grad():
         model.eval()
-        sample_keys, sample_vals, sample_mask = encode_kv_memory_chunked(
-            model, sample_batch[2].to(device), device, chunk_size, slots_per_chunk)
+        sample_keys, sample_vals, sample_mask = encode_frozen(
+            model, sample_batch[2].to(device), device)
         n_valid = sample_mask.sum(dim=1).float().mean().item()
         print(f"  Avg valid slots: {n_valid:.1f} / {sample_keys.size(1)}")
         log_memory_diagnostics(sample_keys, "  Init keys")
@@ -973,22 +1230,22 @@ def train_phase_d(model, cfg, device, train_examples, val_examples,
         for pg in optimizer.param_groups:
             pg["lr"] = lr_now
 
-        # D1: frozen encoding, memory-only (teaches reader to use memory)
-        # D2: differentiable encoding, memory-only (encoder + reader co-adapt)
+        # D1: frozen encoding (teaches decoder to read from memory)
+        # D2: differentiable encoding (encoder + decoder co-adapt end-to-end)
         if step >= context_fade_start:
-            mem_keys, mem_vals, mem_mask = encode_kv_memory_chunked_differentiable(
-                model, passages, device, chunk_size, slots_per_chunk)
+            mem_keys, mem_vals, mem_mask = encode_diff(
+                model, passages, device)
         else:
             model.eval()
-            mem_keys, mem_vals, mem_mask = encode_kv_memory_chunked(
-                model, passages, device, chunk_size, slots_per_chunk)
+            mem_keys, mem_vals, mem_mask = encode_frozen(
+                model, passages, device)
             model.train()
 
-        # Both D1 and D2: memory-only QA (no context passage in input)
+        # Memory-only QA (no context passage in input)
         inp_d = inp
         tgt_d = tgt
 
-        # Forward
+        # Decoder forward
         logits, halt_logits, hidden = model(
             inp_d, memory_keys=mem_keys, memory_values=mem_vals,
             memory_mask=mem_mask, return_hidden=True
@@ -1015,10 +1272,9 @@ def train_phase_d(model, cfg, device, train_examples, val_examples,
         if step % 25 == 0 or step == 1:
             elapsed = time.time() - t0
             eta = elapsed / step * (steps - step) if step > 0 else 0
-            phase_tag = "D1" if step < context_fade_start else "D2*"  # * = differentiable
+            phase_tag = "D1" if step < context_fade_start else "D2*"
             trend = tracker.loss_trend
 
-            c_tag = ""
             print(f"  [{phase_tag} {step:>5}/{steps}] "
                   f"loss={loss.item():.4f} avg={tracker.avg_loss:.4f}{trend} "
                   f"gnorm={grad_norm:.2f} "
@@ -1031,8 +1287,8 @@ def train_phase_d(model, cfg, device, train_examples, val_examples,
             print(f"\n  ┌─── Diagnostics @ step {step} ───")
             model.eval()
             with torch.no_grad():
-                diag_keys, diag_vals, diag_mask = encode_kv_memory_chunked(
-                    model, passages[:4], device, chunk_size, slots_per_chunk)
+                diag_keys, diag_vals, diag_mask = encode_frozen(
+                    model, passages[:4], device)
                 n_valid = diag_mask[:4].sum(dim=1).float().mean().item()
                 print(f"  │ Valid slots: {n_valid:.1f}/{diag_keys.size(1)}")
                 log_memory_diagnostics(diag_keys, "  │ Keys")
@@ -1056,7 +1312,7 @@ def train_phase_d(model, cfg, device, train_examples, val_examples,
         if step % eval_interval == 0 or step == steps:
             acc, breakdown = evaluate_memory_qa(
                 model, cfg, val_examples, device, max_examples=200,
-                return_breakdown=True)
+                return_breakdown=True, encoder_mode=encoder_mode)
             tracker.add_eval(step, acc, breakdown)
 
             # Show detailed eval results
@@ -1103,10 +1359,11 @@ def train_phase_d(model, cfg, device, train_examples, val_examples,
 
 @torch.no_grad()
 def evaluate_memory_qa(model, cfg, examples, device, max_examples=200,
-                       return_breakdown=False):
+                       return_breakdown=False, encoder_mode='enc_dec'):
     """
-    Evaluate memory recall with streaming video-frame encoding.
-    For each example: encode passage chunks → memory → predict.
+    Evaluate memory recall with specified encoder.
+    encoder_mode='enc_dec': multi-iteration bidirectional encoder
+    encoder_mode='streaming': legacy chunked streaming encoder
     """
     model.eval()
     d_model = cfg.d_model
@@ -1123,8 +1380,16 @@ def evaluate_memory_qa(model, cfg, examples, device, max_examples=200,
         passage_ids = tokenize(ex.passage)
 
         p_tensor = torch.tensor([passage_ids], dtype=torch.long, device=device)
-        mem_keys, mem_vals, mem_mask = encode_kv_memory_chunked(
-            model, p_tensor, device, chunk_size, slots_per_chunk)
+
+        if encoder_mode == 'enc_dec':
+            mem_keys, mem_vals, mem_mask = encode_enc_dec_frozen(
+                model, p_tensor, device)
+        elif encoder_mode == 'sentence':
+            mem_keys, mem_vals, mem_mask = encode_sentence_frozen(
+                model, p_tensor, device)
+        else:
+            mem_keys, mem_vals, mem_mask = encode_kv_memory_chunked(
+                model, p_tensor, device, chunk_size, slots_per_chunk)
 
         # Build question input
         question_ids = tokenize(ex.question)
@@ -1193,8 +1458,8 @@ def evaluate_context_qa(model, cfg, examples, device, max_examples=200):
     return accuracy
 
 
-def detailed_eval(model, cfg, examples, device, n=10):
-    """Print detailed examples with streaming memory."""
+def detailed_eval(model, cfg, examples, device, n=10, encoder_mode='enc_dec'):
+    """Print detailed examples with specified encoder."""
     model.eval()
     d_model = cfg.d_model
     chunk_size = getattr(cfg, 'chunk_size', 8)
@@ -1208,8 +1473,15 @@ def detailed_eval(model, cfg, examples, device, n=10):
 
         p_tensor = torch.tensor([passage_ids], dtype=torch.long, device=device)
         with torch.no_grad():
-            mem_keys, mem_vals, mem_mask = encode_kv_memory_chunked(
-                model, p_tensor, device, chunk_size, slots_per_chunk)
+            if encoder_mode == 'enc_dec':
+                mem_keys, mem_vals, mem_mask = encode_enc_dec_frozen(
+                    model, p_tensor, device)
+            elif encoder_mode == 'sentence':
+                mem_keys, mem_vals, mem_mask = encode_sentence_frozen(
+                    model, p_tensor, device)
+            else:
+                mem_keys, mem_vals, mem_mask = encode_kv_memory_chunked(
+                    model, p_tensor, device, chunk_size, slots_per_chunk)
 
         # Question input
         question_ids = tokenize(ex.question)
@@ -1269,6 +1541,11 @@ def main():
     parser.add_argument("--phase_b_steps", type=int, default=300)
     parser.add_argument("--phase_c_steps", type=int, default=500)
     parser.add_argument("--phase_d_steps", type=int, default=3000)
+    parser.add_argument("--encoder_mode", default="sentence",
+                        choices=["enc_dec", "streaming", "sentence"],
+                        help="Memory encoder: sentence (sentence-boundary bidir), enc_dec (multi-iter bidir), or streaming (chunked)")
+    parser.add_argument("--chunk_size", type=int, default=None,
+                        help="Override chunk_size for streaming encoder")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -1292,6 +1569,8 @@ def main():
 
     cfg = MicroModelConfig()
     cfg.vocab_size = VOCAB_SIZE  # override with actual vocab size
+    if args.chunk_size is not None:
+        cfg.chunk_size = args.chunk_size
     print(f"  Device:     {device}")
     print(f"  Vocab:      {VOCAB_SIZE} words")
 
@@ -1370,7 +1649,9 @@ def main():
 
     # Memory QA baseline (before Phase D)
     print("\n  Memory QA BEFORE Phase D (random baseline):")
-    pre_d_acc = evaluate_memory_qa(model, cfg, val_examples, device, max_examples=200)
+    pre_d_acc = evaluate_memory_qa(model, cfg, val_examples, device,
+                                   max_examples=200,
+                                   encoder_mode=args.encoder_mode)
     print(f"  → {pre_d_acc:.1%}")
 
     # Phase D: Memory QA (the real test)
@@ -1379,7 +1660,7 @@ def main():
     best_acc = train_phase_d(
         model, cfg, device, train_examples, val_examples, mem_dir,
         steps=args.phase_d_steps, lr=1e-4, batch_size=32,
-        eval_interval=200,
+        eval_interval=200, encoder_mode=args.encoder_mode,
     )
 
     # Final report
@@ -1395,7 +1676,8 @@ def main():
     print(f"  ACT fix:         halt bias [0,0] (50/50 init)")
 
     # Detailed eval
-    detailed_eval(model, cfg, val_examples, device, n=10)
+    detailed_eval(model, cfg, val_examples, device, n=10,
+                  encoder_mode=args.encoder_mode)
 
     # Save final report
     report = {
