@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import os
+import re
 import sys
 import time
 
@@ -34,8 +35,40 @@ from train_micro import (
     VOCAB, VOCAB_SIZE, ID2WORD, PAD_ID, BOS_ID, EOS_ID, ANS_ID,
     tokenize, detokenize,
     encode_sentence_frozen, sliding_lm_encode,
-    tag_text, _DATAPLANES,
+    tag_text, tag_passage, _DATAPLANES,
 )
+
+# Matches source provenance tags like "social/alice@2026-03-06T10:05:00Z: "
+_TAG_RE = re.compile(
+    r'^([a-z]+)/([a-z0-9]+)@\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z: '
+)
+
+# ANSI color codes per dataplane
+_DATAPLANE_COLORS = {
+    "observer": "\033[36m",   # cyan
+    "news":     "\033[33m",   # yellow
+    "social":   "\033[35m",   # magenta
+    "wiki":     "\033[32m",   # green
+    "shell":    "\033[31m",   # red
+    "log":      "\033[34m",   # blue
+}
+_RESET = "\033[0m"
+_BOLD = "\033[1m"
+
+
+def format_tagged_line(line: str) -> str:
+    """Parse a source tag and return a color-formatted line.
+
+    Input:  'social/alice@2026-03-06T10:05:00Z: Hello world'
+    Output: '\033[1m\033[35m[social/alice]\033[0m Hello world'
+    """
+    m = _TAG_RE.match(line)
+    if not m:
+        return line
+    dataplane, author = m.group(1), m.group(2)
+    content = line[m.end():]
+    color = _DATAPLANE_COLORS.get(dataplane, "\033[37m")
+    return f"{_BOLD}{color}[{dataplane}/{author}]{_RESET} {content}"
 
 
 def load_model(checkpoint_path: str, device: str):
@@ -76,7 +109,7 @@ def generate_autoregressive(model, cfg, prompt_ids, device,
                             top_k=50, top_p=0.9, repetition_penalty=1.2,
                             mem_keys=None, mem_vals=None, mem_mask=None,
                             use_sliding=False, window_size=8, num_passes=4,
-                            stop_on_eos=True, stream=True):
+                            stop_on_eos=True, stream=True, strip_output_tags=False):
     """Generate tokens autoregressively with configurable sampling."""
     model.eval()
 
@@ -85,7 +118,8 @@ def generate_autoregressive(model, cfg, prompt_ids, device,
             model, cfg, prompt_ids, device, max_new_tokens, temperature,
             top_k, top_p, repetition_penalty,
             mem_keys, mem_vals, mem_mask,
-            window_size, num_passes, stop_on_eos, stream)
+            window_size, num_passes, stop_on_eos, stream,
+            strip_output_tags)
 
     # Standard causal generation with KV cache
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
@@ -100,6 +134,7 @@ def generate_autoregressive(model, cfg, prompt_ids, device,
 
     generated = list(prompt_ids)
     pos = T
+    line_buf = []  # Buffer for tag-aware line output
 
     for _ in range(max_new_tokens):
         next_logits = logits[0, -1, :].float()
@@ -143,11 +178,23 @@ def generate_autoregressive(model, cfg, prompt_ids, device,
         if stop_on_eos and next_token == EOS_ID:
             break
 
-        # Stream output
-        if stream and 32 <= next_token < 127:
-            print(chr(next_token), end='', flush=True)
-        elif stream and next_token == ord('\n'):
-            print(flush=True)
+        # Stream output with tag-aware line buffering
+        if stream:
+            if next_token == ord('\n'):
+                line = bytes(line_buf).decode('utf-8', errors='replace')
+                if strip_output_tags:
+                    line = format_tagged_line(line)
+                print(line, flush=True)
+                line_buf = []
+            else:
+                line_buf.append(next_token)
+                # Buffer until tag window passes (~42 chars) to parse tags
+                if not strip_output_tags or len(line_buf) > 45:
+                    chunk = bytes(line_buf).decode('utf-8', errors='replace')
+                    if strip_output_tags:
+                        chunk = format_tagged_line(chunk)
+                    print(chunk, end='', flush=True)
+                    line_buf = []
 
         # Next step
         next_input = torch.tensor([[next_token]], dtype=torch.long, device=device)
@@ -156,7 +203,13 @@ def generate_autoregressive(model, cfg, prompt_ids, device,
                                  memory_mask=mem_mask)
         pos += 1
 
-    if stream:
+    # Flush remaining buffer
+    if stream and line_buf:
+        line = bytes(line_buf).decode('utf-8', errors='replace')
+        if strip_output_tags:
+            line = format_tagged_line(line)
+        print(line)
+    elif stream:
         print()
 
     return generated[len(prompt_ids):]
@@ -167,9 +220,11 @@ def _generate_sliding(model, cfg, prompt_ids, device,
                       max_new_tokens, temperature, top_k, top_p,
                       repetition_penalty,
                       mem_keys, mem_vals, mem_mask,
-                      window_size, num_passes, stop_on_eos, stream):
+                      window_size, num_passes, stop_on_eos, stream,
+                      strip_output_tags=False):
     """Generate using sliding window encoder (bidirectional per window)."""
     generated = list(prompt_ids)
+    line_buf = []
 
     for _ in range(max_new_tokens):
         input_tensor = torch.tensor([generated], dtype=torch.long, device=device)
@@ -214,12 +269,28 @@ def _generate_sliding(model, cfg, prompt_ids, device,
         if stop_on_eos and next_token == EOS_ID:
             break
 
-        if stream and 32 <= next_token < 127:
-            print(chr(next_token), end='', flush=True)
-        elif stream and next_token == ord('\n'):
-            print(flush=True)
+        if stream:
+            if next_token == ord('\n'):
+                line = bytes(line_buf).decode('utf-8', errors='replace')
+                if strip_output_tags:
+                    line = format_tagged_line(line)
+                print(line, flush=True)
+                line_buf = []
+            else:
+                line_buf.append(next_token)
+                if not strip_output_tags or len(line_buf) > 45:
+                    chunk = bytes(line_buf).decode('utf-8', errors='replace')
+                    if strip_output_tags:
+                        chunk = format_tagged_line(chunk)
+                    print(chunk, end='', flush=True)
+                    line_buf = []
 
-    if stream:
+    if stream and line_buf:
+        line = bytes(line_buf).decode('utf-8', errors='replace')
+        if strip_output_tags:
+            line = format_tagged_line(line)
+        print(line)
+    elif stream:
         print()
 
     return generated[len(prompt_ids):]
@@ -228,7 +299,7 @@ def _generate_sliding(model, cfg, prompt_ids, device,
 def encode_passage_to_memory(model, passage_text, device, tagged=False):
     """Encode a passage into memory vectors for QA."""
     if tagged:
-        passage_text = tag_text(passage_text, dataplane="observer")
+        passage_text = tag_passage(passage_text)
     passage_ids = tokenize(passage_text)
     p_tensor = torch.tensor([passage_ids], dtype=torch.long, device=device)
     mem_keys, mem_vals, mem_mask = encode_sentence_frozen(model, p_tensor, device)
@@ -291,6 +362,7 @@ def main():
     ckpt_path = args.checkpoint
     if ckpt_path is None:
         candidates = [
+            "checkpoints/local_test/multitask/best_multitask.pt",
             "checkpoints/micro/multitask/best_multitask.pt",
             "checkpoints/micro/sliding_lm/best_model.pt",
             "checkpoints/micro/memory/best_model.pt",
@@ -426,7 +498,7 @@ def main():
                         mem_keys=mem_keys, mem_vals=mem_vals, mem_mask=mem_mask,
                         use_sliding=(mode == "sliding"),
                         window_size=window_size, num_passes=num_passes,
-                        stream=True)
+                        stream=True, strip_output_tags=tagged)
                     elapsed = time.time() - t0
                     n_gen = len(tokens)
                     print(f"  \033[2m({n_gen} tokens, {elapsed:.2f}s, "
@@ -469,7 +541,7 @@ def main():
             mem_mask=mem_mask if use_mem else None,
             use_sliding=(mode == "sliding"),
             window_size=window_size, num_passes=num_passes,
-            stream=True)
+            stream=True, strip_output_tags=tagged)
         elapsed = time.time() - t0
         n_gen = len(tokens)
         print(f"  \033[2m({n_gen} tokens, {elapsed:.2f}s, "
