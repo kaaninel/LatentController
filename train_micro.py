@@ -2543,7 +2543,7 @@ def train_multitask(model, cfg, device, train_examples, val_examples,
 
         total_loss = torch.tensor(0.0, device=device)
 
-        # ── LM loss on diverse text ──
+        # ── LM loss on diverse text (causal forward, no sliding window) ──
         try:
             lm_inp, lm_tgt = next(lm_iter)
         except StopIteration:
@@ -2551,8 +2551,7 @@ def train_multitask(model, cfg, device, train_examples, val_examples,
             lm_inp, lm_tgt = next(lm_iter)
         lm_inp, lm_tgt = lm_inp.to(device), lm_tgt.to(device)
 
-        lm_hidden = sliding_lm_encode(model, lm_inp, window_size, num_passes)
-        lm_logits = F.linear(lm_hidden, model.embed.weight)
+        lm_logits, _ = model(token_ids=lm_inp)
         lm_loss = F.cross_entropy(
             lm_logits.reshape(-1, VOCAB_SIZE),
             lm_tgt.reshape(-1),
@@ -2786,62 +2785,7 @@ def main():
     # ===== Full Training Pipeline =====
     t_start = time.time()
 
-    if args.encoder_mode == 'sliding_lm':
-        # ── Sliding window LM with memory cross-attention ──
-        window_size = cfg.chunk_size if args.chunk_size is not None else 5
-        num_passes = args.num_passes
-
-        print("\n" + "─" * 60)
-        print(f"  Pipeline: A({args.phase_a_steps}) → SlidingLM({args.phase_d_steps})")
-        print("─" * 60)
-
-        # Phase A: LM warmup (teaches embeddings + basic attention)
-        loss_a = train_phase_a(model, cfg, device, train_examples,
-                               steps=args.phase_a_steps, batch_size=64)
-
-        print("\n  Context QA after Phase A:")
-        ctx_acc_a = evaluate_context_qa(model, cfg, val_examples, device)
-        print(f"  → {ctx_acc_a:.1%}")
-
-        # Sliding LM training with memory (replaces B/C/D)
-        slm_dir = os.path.join(args.output_dir, "sliding_lm")
-        os.makedirs(slm_dir, exist_ok=True)
-        best_acc = train_sliding_lm(
-            model, cfg, device, train_examples, val_examples, slm_dir,
-            steps=args.phase_d_steps, lr=1e-4, batch_size=32,
-            eval_interval=200,
-            window_size=window_size, num_passes=num_passes,
-            d1_ratio=args.d1_ratio,
-        )
-
-        # Final report
-        total_time = time.time() - t_start
-        print("\n" + "=" * 60)
-        print("  FINAL REPORT — Sliding Window LM + Memory")
-        print("=" * 60)
-        print(f"  Total time:      {total_time:.0f}s ({total_time/60:.1f} min)")
-        print(f"  Parameters:      {n_params:,}")
-        print(f"  Window size:     {window_size}")
-        print(f"  Num passes:      {num_passes}")
-        print(f"  Context QA:      {ctx_acc_a:.1%} (after Phase A)")
-        print(f"  Sliding LM QA:   {best_acc:.1%}")
-        print(f"  Target:          >80% QA accuracy")
-
-        report = {
-            "total_time_s": total_time,
-            "n_params": n_params,
-            "mode": "sliding_lm",
-            "window_size": window_size,
-            "num_passes": num_passes,
-            "context_qa_acc": ctx_acc_a,
-            "sliding_lm_acc": best_acc,
-            "config": {
-                "d_model": cfg.d_model, "n_layers": cfg.n_layers,
-                "n_heads": cfg.n_heads, "vocab_size": VOCAB_SIZE,
-            },
-            "device": device,
-        }
-    elif args.multitask:
+    if args.multitask:
         # ── Multi-task: LM (shell + wiki) + QA (bAbI) ──
         window_size = cfg.chunk_size if args.chunk_size is not None else 16
         num_passes = args.num_passes
@@ -2894,6 +2838,61 @@ def main():
             "n_wiki": args.n_wiki,
             "context_qa_acc": ctx_acc_a,
             "multitask_qa_acc": best_acc,
+            "config": {
+                "d_model": cfg.d_model, "n_layers": cfg.n_layers,
+                "n_heads": cfg.n_heads, "vocab_size": VOCAB_SIZE,
+            },
+            "device": device,
+        }
+    elif args.encoder_mode == 'sliding_lm':
+        # ── Sliding window LM with memory cross-attention ──
+        window_size = cfg.chunk_size if args.chunk_size is not None else 5
+        num_passes = args.num_passes
+
+        print("\n" + "─" * 60)
+        print(f"  Pipeline: A({args.phase_a_steps}) → SlidingLM({args.phase_d_steps})")
+        print("─" * 60)
+
+        # Phase A: LM warmup (teaches embeddings + basic attention)
+        loss_a = train_phase_a(model, cfg, device, train_examples,
+                               steps=args.phase_a_steps, batch_size=64)
+
+        print("\n  Context QA after Phase A:")
+        ctx_acc_a = evaluate_context_qa(model, cfg, val_examples, device)
+        print(f"  → {ctx_acc_a:.1%}")
+
+        # Sliding LM training with memory (replaces B/C/D)
+        slm_dir = os.path.join(args.output_dir, "sliding_lm")
+        os.makedirs(slm_dir, exist_ok=True)
+        best_acc = train_sliding_lm(
+            model, cfg, device, train_examples, val_examples, slm_dir,
+            steps=args.phase_d_steps, lr=1e-4, batch_size=32,
+            eval_interval=200,
+            window_size=window_size, num_passes=num_passes,
+            d1_ratio=args.d1_ratio,
+        )
+
+        # Final report
+        total_time = time.time() - t_start
+        print("\n" + "=" * 60)
+        print("  FINAL REPORT — Sliding Window LM + Memory")
+        print("=" * 60)
+        print(f"  Total time:      {total_time:.0f}s ({total_time/60:.1f} min)")
+        print(f"  Parameters:      {n_params:,}")
+        print(f"  Window size:     {window_size}")
+        print(f"  Num passes:      {num_passes}")
+        print(f"  Context QA:      {ctx_acc_a:.1%} (after Phase A)")
+        print(f"  Sliding LM QA:   {best_acc:.1%}")
+        print(f"  Target:          >80% QA accuracy")
+
+        report = {
+            "total_time_s": total_time,
+            "n_params": n_params,
+            "mode": "sliding_lm",
+            "window_size": window_size,
+            "num_passes": num_passes,
+            "context_qa_acc": ctx_acc_a,
+            "sliding_lm_acc": best_acc,
             "config": {
                 "d_model": cfg.d_model, "n_layers": cfg.n_layers,
                 "n_heads": cfg.n_heads, "vocab_size": VOCAB_SIZE,
