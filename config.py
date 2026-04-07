@@ -177,13 +177,13 @@ class MicroModelConfig:
     n_text_positions: int = 181       # 192 - 11
     n_addr_heads: int = 3
     addr_dim: int = 8
-    pad_id: int = 0
-    eos_id: int = 1
-    bos_id: int = 2
-    unk_id: int = 3
-    mem_start_id: int = 4
-    mem_end_id: int = 5
-    noop_id: int = 6
+    pad_id: int = 0x00              # NUL
+    eos_id: int = 0x03              # ETX
+    bos_id: int = 0x02              # STX
+    unk_id: int = 0x1A              # SUB
+    mem_start_id: int = 0x01        # SOH
+    mem_end_id: int = 0x04          # EOT
+    noop_id: int = 0x06             # ACK
     # Cross-attention memory: Attn → MemCrossAttn → FFN per block
     use_memory_cross_attention: bool = True
     memory_topk: int = 0            # 0=softmax, >0=top-k sparse attention with STE

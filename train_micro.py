@@ -162,29 +162,40 @@ def log_gradient_stats(model):
     return total_norm, {k: v ** 0.5 for k, v in module_norms.items()}
 
 # ============================================================================
-# Byte-Level Tokenizer — UTF-8 bytes, 264 tokens total
+# Byte-Level Tokenizer — pure UTF-8, vocab = 256 (raw bytes)
+# Control characters serve as special tokens — no offset, no extra IDs.
 # ============================================================================
 
-SPECIAL_TOKENS = {
-    "<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3,
-    "<mem_start>": 4, "<mem_end>": 5, "<noop>": 6, "<ans>": 7,
-}
-BYTE_OFFSET = len(SPECIAL_TOKENS)  # 8
-VOCAB_SIZE = 256 + BYTE_OFFSET     # 264
+# ASCII control characters as special tokens (identity-mapped)
+PAD_ID  = 0x00  # NUL — padding
+SOH_ID  = 0x01  # SOH — memory section start
+BOS_ID  = 0x02  # STX — start of text
+EOS_ID  = 0x03  # ETX — end of text
+EOT_ID  = 0x04  # EOT — memory section end
+ANS_ID  = 0x05  # ENQ — answer/query marker
+NOOP_ID = 0x06  # ACK — no-op
+UNK_ID  = 0x1A  # SUB — substitute/unknown
 
-# VOCAB dict: special tokens + single-char convenience lookups
+VOCAB_SIZE = 256  # pure byte space, no extras
+
+# Backward-compatible VOCAB dict for code that does VOCAB["<pad>"] etc.
+SPECIAL_TOKENS = {
+    "<pad>": PAD_ID, "<eos>": EOS_ID, "<bos>": BOS_ID, "<unk>": UNK_ID,
+    "<mem_start>": SOH_ID, "<mem_end>": EOT_ID, "<noop>": NOOP_ID, "<ans>": ANS_ID,
+}
 VOCAB = dict(SPECIAL_TOKENS)
 for _b in range(256):
     _ch = chr(_b)
     if _ch not in VOCAB:
-        VOCAB[_ch] = _b + BYTE_OFFSET
+        VOCAB[_ch] = _b
 
 # Reverse mapping for display
 ID2WORD = {}
 for _name, _tid in SPECIAL_TOKENS.items():
     ID2WORD[_tid] = _name
 for _b in range(256):
-    ID2WORD[_b + BYTE_OFFSET] = chr(_b) if 32 <= _b < 127 else f'\\x{_b:02x}'
+    if _b not in ID2WORD:
+        ID2WORD[_b] = chr(_b) if 32 <= _b < 127 else f'\\x{_b:02x}'
 
 # bAbI word lists — still needed for data generation
 NAMES = [
@@ -203,17 +214,14 @@ CONNECTORS = ["then", "after", "that"]
 
 
 def tokenize(text: str) -> list[int]:
-    """Encode text as UTF-8 bytes. Each byte maps to token ID = byte + BYTE_OFFSET."""
-    return [b + BYTE_OFFSET for b in text.encode('utf-8')]
+    """Encode text as raw UTF-8 bytes. Token ID = byte value (no offset)."""
+    return list(text.encode('utf-8'))
 
 
 def detokenize(ids: list[int]) -> str:
-    """Decode token IDs back to text. Skips special tokens."""
-    skip = set(SPECIAL_TOKENS.values())
-    raw_bytes = bytes(
-        max(0, i - BYTE_OFFSET) for i in ids
-        if i not in skip and i >= BYTE_OFFSET
-    )
+    """Decode token IDs back to text. Skips control chars used as special tokens."""
+    skip = {PAD_ID, BOS_ID, EOS_ID, SOH_ID, EOT_ID, ANS_ID, NOOP_ID}
+    raw_bytes = bytes(b for b in ids if b not in skip and 0 <= b < 256)
     return raw_bytes.decode('utf-8', errors='replace')
 
 
