@@ -69,11 +69,12 @@ class SiLUFFN(nn.Module):
 # ---------------------------------------------------------------------------
 
 class Attention(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, window_size: int = 0):
         super().__init__()
         self.n_heads = cfg.n_heads
         self.head_dim = cfg.head_dim
         self.scale = cfg.head_dim ** -0.5
+        self.window_size = window_size  # 0 = unlimited
         d = cfg.d_model
         self.q = nn.Linear(d, cfg.n_heads * cfg.head_dim, bias=False)
         self.k = nn.Linear(d, cfg.n_heads * cfg.head_dim, bias=False)
@@ -95,6 +96,12 @@ class Attention(nn.Module):
             cached_k, cached_v = kv_cache
             k = mx.concatenate([cached_k, k], axis=2)
             v = mx.concatenate([cached_v, v], axis=2)
+
+        # Sliding window: keep only last W positions in cache
+        if self.window_size > 0 and k.shape[2] > self.window_size:
+            k = k[:, :, -self.window_size:, :]
+            v = v[:, :, -self.window_size:, :]
+
         new_cache = (k, v)
 
         # Scaled dot-product attention
@@ -200,10 +207,10 @@ class MultiHopMemoryAttention(nn.Module):
 # ---------------------------------------------------------------------------
 
 class TransformerBlock(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, window_size: int = 0):
         super().__init__()
         self.norm1 = RMSNorm(cfg.d_model)
-        self.attn = Attention(cfg)
+        self.attn = Attention(cfg, window_size=window_size)
 
         self.use_mem_attn = getattr(cfg, 'use_memory_cross_attention', False)
         if self.use_mem_attn:
@@ -237,11 +244,12 @@ class TransformerBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 class LoopedLatentControllerMLX(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, window_size: int = 0):
         super().__init__()
         self.cfg = cfg
         self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.layers = [TransformerBlock(cfg) for _ in range(cfg.n_layers)]
+        self.layers = [TransformerBlock(cfg, window_size=window_size)
+                       for _ in range(cfg.n_layers)]
         self.norm = RMSNorm(cfg.d_model)
 
         self.halt_head = nn.Linear(cfg.d_model, 2, bias=True)
@@ -282,23 +290,116 @@ class LoopedLatentControllerMLX(nn.Module):
         halt_logits = self.halt_head(hidden)
         return logits, halt_logits, new_kv
 
-    def generate(self, prompt, gen_len=64):
-        """Autoregressive generation — the path we're optimising."""
-        # Prefill
+    def generate(self, prompt, gen_len=64, speculative_k=0):
+        """Autoregressive generation with optional speculative decoding.
+
+        Args:
+            prompt: (B, T) token IDs
+            gen_len: number of tokens to generate
+            speculative_k: draft length for speculative decoding (0=disabled)
+        """
+        if speculative_k > 0:
+            return self._generate_speculative(prompt, gen_len, speculative_k)
+
+        # Standard decode
         logits, _, kv = self(prompt)
         tok = mx.argmax(logits[:, -1:, :], axis=-1)
         tokens = [tok]
         pos = prompt.shape[1]
 
-        # Decode loop
         for _ in range(gen_len - 1):
             logits, _, kv = self(tok, kv_cache=kv, cache_position=pos)
             tok = mx.argmax(logits[:, -1:, :], axis=-1)
             tokens.append(tok)
             pos += 1
 
-        mx.eval(tokens[-1])  # force evaluation of full graph
+        mx.eval(tokens[-1])
         return mx.concatenate([prompt] + tokens, axis=1)
+
+    def _generate_speculative(self, prompt, gen_len, draft_k):
+        """Speculative decoding with n-gram draft model."""
+        B = prompt.shape[0]
+        ngram_n = 3
+        ngram_table = {}
+
+        def ngram_draft(context, k):
+            drafts, ctx = [], list(context[-ngram_n:])
+            for _ in range(k):
+                key = tuple(ctx[-ngram_n:])
+                if key in ngram_table:
+                    tok = ngram_table[key]
+                    drafts.append(tok)
+                    ctx.append(tok)
+                else:
+                    break
+            return drafts
+
+        def ngram_update(tokens):
+            for i in range(len(tokens) - ngram_n):
+                ngram_table[tuple(tokens[i:i + ngram_n])] = tokens[i + ngram_n]
+
+        logits, _, kv = self(prompt)
+        tok = mx.argmax(logits[:, -1:, :], axis=-1)
+        mx.eval(tok)
+
+        all_tokens = list(prompt[0].tolist()) + [int(tok[0, 0])]
+        result_tokens = [tok]
+        pos = prompt.shape[1]
+        generated = 1
+
+        while generated < gen_len:
+            drafts = ngram_draft(all_tokens, draft_k)
+
+            if drafts:
+                verify_in = mx.array([[all_tokens[-1]] + drafts] * B)
+                logits, _, new_kv = self(verify_in, kv_cache=kv,
+                                         cache_position=pos)
+                mx.eval(logits)
+                verified = mx.argmax(logits[0], axis=-1).tolist()
+
+                accepted = 0
+                for d, v in zip(drafts, verified):
+                    if d == v:
+                        accepted += 1
+                    else:
+                        break
+
+                for i in range(accepted):
+                    all_tokens.append(drafts[i])
+                    result_tokens.append(mx.array([[drafts[i]]] * B))
+                    generated += 1
+                    if generated >= gen_len:
+                        break
+
+                if generated < gen_len:
+                    next_tok = verified[accepted]
+                    all_tokens.append(next_tok)
+                    result_tokens.append(mx.array([[next_tok]] * B))
+                    generated += 1
+
+                n_accept = min(accepted + 1, len(drafts))
+                if accepted < len(drafts):
+                    kv = [(k_c[:, :, :pos + accepted + 1, :],
+                           v_c[:, :, :pos + accepted + 1, :])
+                          for k_c, v_c in new_kv]
+                else:
+                    kv = new_kv
+                pos += accepted + 1
+            else:
+                logits, _, kv = self(mx.array([[all_tokens[-1]]] * B),
+                                     kv_cache=kv, cache_position=pos)
+                tok = mx.argmax(logits[:, -1:, :], axis=-1)
+                mx.eval(tok)
+                next_tok = int(tok[0, 0])
+                all_tokens.append(next_tok)
+                result_tokens.append(tok)
+                generated += 1
+                pos += 1
+
+            ngram_update(all_tokens)
+
+        mx.eval(result_tokens[-1])
+        return mx.concatenate([prompt] + result_tokens[:gen_len], axis=1)
 
 
 # ---------------------------------------------------------------------------
@@ -342,9 +443,9 @@ def convert_torch_to_mlx(torch_model) -> dict:
     return mlx_weights
 
 
-def load_from_torch(torch_model, cfg: ModelConfig):
+def load_from_torch(torch_model, cfg: ModelConfig, window_size: int = 0):
     """Create MLX model and load weights from a PyTorch model."""
-    mlx_model = LoopedLatentControllerMLX(cfg)
+    mlx_model = LoopedLatentControllerMLX(cfg, window_size=window_size)
     weights = convert_torch_to_mlx(torch_model)
 
     # Load weights into MLX model
@@ -372,7 +473,7 @@ def load_from_torch(torch_model, cfg: ModelConfig):
     return mlx_model
 
 
-def load_from_checkpoint(path: str, cfg: ModelConfig):
+def load_from_checkpoint(path: str, cfg: ModelConfig, window_size: int = 0):
     """Load MLX model from a PyTorch checkpoint file."""
     import torch
     from model import LoopedLatentController
@@ -383,4 +484,4 @@ def load_from_checkpoint(path: str, cfg: ModelConfig):
     torch_model = LoopedLatentController(cfg, use_checkpoint=False)
     torch_model.load_state_dict(sd, strict=False)
 
-    return load_from_torch(torch_model, cfg)
+    return load_from_torch(torch_model, cfg, window_size=window_size)
