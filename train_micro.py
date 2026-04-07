@@ -1356,6 +1356,7 @@ def sliding_lm_encode(model, input_ids, window_size=5, num_passes=4,
     B, T = input_ids.shape
     device = input_ids.device
     half_w = window_size // 2
+    pad_right_size = window_size - half_w - 1  # handles even/odd W correctly
     d_model = model.cfg.d_model
 
     # PAD embedding for edge padding
@@ -1381,9 +1382,9 @@ def sliding_lm_encode(model, input_ids, window_size=5, num_passes=4,
             w_mem_mask = mem_mask.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)
 
     for _ in range(num_passes):
-        # Pad edges with PAD embedding
+        # Pad edges with PAD embedding (asymmetric for even W)
         pad_left = pad_emb.expand(B, half_w, d_model)
-        pad_right = pad_emb.expand(B, half_w, d_model)
+        pad_right = pad_emb.expand(B, pad_right_size, d_model)
         padded = torch.cat([pad_left, hidden, pad_right], dim=1)
 
         # Create all windows: unfold → (B, T, d_model, W) → (B, T, W, d_model)
