@@ -1803,7 +1803,7 @@ def encode_sliding_differentiable(model, passages, device, **kwargs):
 
 def sliding_lm_encode(model, input_ids, window_size=5, num_passes=4,
                       mem_keys=None, mem_vals=None, mem_mask=None,
-                      causal=False):
+                      causal=False, stride=1):
     """
     Multi-pass sliding window encoder with optional memory cross-attention.
 
@@ -1859,13 +1859,9 @@ def sliding_lm_encode(model, input_ids, window_size=5, num_passes=4,
     else:
         mask = torch.zeros(window_size, window_size, device=device)
 
-    # Expand memory for windowed processing: (B, S, D) → (B*T, S, D)
-    w_mem_keys, w_mem_vals, w_mem_mask = None, None, None
-    if mem_keys is not None:
-        w_mem_keys = mem_keys.unsqueeze(1).expand(-1, T, -1, -1).reshape(B * T, -1, d_model)
-        w_mem_vals = mem_vals.unsqueeze(1).expand(-1, T, -1, -1).reshape(B * T, -1, d_model)
-        if mem_mask is not None:
-            w_mem_mask = mem_mask.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)
+    # Number of windows depends on stride
+    n_win = (T + half_w + pad_right_size - window_size) // stride + 1
+    # Simpler: compute after first unfold. Pre-expand memory after we know n_win.
 
     for _ in range(num_passes):
         # Pad edges with PAD embedding (asymmetric for even W)
@@ -1873,12 +1869,21 @@ def sliding_lm_encode(model, input_ids, window_size=5, num_passes=4,
         pad_right = pad_emb.expand(B, pad_right_size, d_model)
         padded = torch.cat([pad_left, hidden, pad_right], dim=1)
 
-        # Create all windows: unfold → (B, T, d_model, W) → (B, T, W, d_model)
-        windows = padded.unfold(1, window_size, 1)
+        # Create windows with stride: (B, n_win, d_model, W) → (B, n_win, W, d_model)
+        windows = padded.unfold(1, window_size, stride)
+        n_win = windows.shape[1]
         windows = windows.permute(0, 1, 3, 2).contiguous()
 
-        # Reshape for batched layer processing: (B*T, W, d_model)
-        x = windows.reshape(B * T, window_size, d_model)
+        # Reshape for batched layer processing: (B*n_win, W, d_model)
+        x = windows.reshape(B * n_win, window_size, d_model)
+
+        # Expand memory for windowed processing: (B, S, D) → (B*n_win, S, D)
+        w_mem_keys, w_mem_vals, w_mem_mask = None, None, None
+        if mem_keys is not None:
+            w_mem_keys = mem_keys.unsqueeze(1).expand(-1, n_win, -1, -1).reshape(B * n_win, -1, d_model)
+            w_mem_vals = mem_vals.unsqueeze(1).expand(-1, n_win, -1, -1).reshape(B * n_win, -1, d_model)
+            if mem_mask is not None:
+                w_mem_mask = mem_mask.unsqueeze(1).expand(-1, n_win, -1).reshape(B * n_win, -1)
 
         # Process through all transformer layers (self-attn + cross-attn to memory)
         for layer in model.layers:
@@ -1887,8 +1892,17 @@ def sliding_lm_encode(model, input_ids, window_size=5, num_passes=4,
                          mem_mask=w_mem_mask)
 
         # Extract center position outputs → new hidden states
-        centers = x[:, half_w, :]
-        hidden = centers.reshape(B, T, d_model)
+        centers = x[:, half_w, :]  # (B*n_win, d_model)
+        centers = centers.reshape(B, n_win, d_model)
+
+        if stride == 1:
+            hidden = centers
+        else:
+            # Scatter strided center outputs back; non-center positions
+            # keep previous hidden state (updated indirectly next pass)
+            indices = torch.arange(n_win, device=device) * stride
+            indices = indices.clamp(max=T - 1)
+            hidden[:, indices] = centers
 
     return model.norm(hidden)
 
@@ -3130,7 +3144,7 @@ def generate_chat_data(n: int = 5000, seed: int = 42) -> list[str]:
 def train_chat(model, cfg, device, output_dir,
                steps_phase1=5000, steps_phase2=5000, steps_phase3=5000,
                lr=3e-4, batch_size=32, grad_accum=1, eval_interval=250,
-               window_size=8, num_passes=4,
+               window_size=8, num_passes=4, stride=1,
                n_wiki=50000, n_shell=5000, n_qa=20000, n_chat=5000,
                use_bf16=False, use_compile=False,
                hf_repo=None, hf_upload_interval=1000):
@@ -3154,6 +3168,7 @@ def train_chat(model, cfg, device, output_dir,
     print("  ANT — Unified Causal Sliding Window Training")
     print("=" * 60)
     print(f"  Window size:     {window_size}")
+    print(f"  Stride:          {stride}")
     print(f"  Num passes:      {num_passes}")
     print(f"  Batch size:      {batch_size} (micro) × {grad_accum} accum = {batch_size * grad_accum} effective")
     print(f"  BF16:            {use_bf16}")
@@ -3219,7 +3234,7 @@ def train_chat(model, cfg, device, output_dir,
         # Warmup compilation
         with torch.no_grad():
             dummy = torch.randint(0, 256, (4, 32), device=device)
-            _ = sliding_lm_encode(model, dummy, window_size, num_passes, causal=True)
+            _ = sliding_lm_encode(model, dummy, window_size, num_passes, causal=True, stride=stride)
         if hasattr(torch.cuda, 'synchronize'):
             torch.cuda.synchronize()
         print("  ✓ Compiled and warmed up")
@@ -3291,7 +3306,7 @@ def train_chat(model, cfg, device, output_dir,
 
             with amp_ctx:
                 lm_hidden = sliding_lm_encode(
-                    model, lm_inp, window_size, num_passes, causal=True)
+                    model, lm_inp, window_size, num_passes, causal=True, stride=stride)
                 lm_logits = F.linear(lm_hidden, model.embed.weight)
                 lm_loss = F.cross_entropy(
                     lm_logits.reshape(-1, VOCAB_SIZE),
@@ -3334,7 +3349,7 @@ def train_chat(model, cfg, device, output_dir,
 
                     qa_hidden = sliding_lm_encode(
                         model, q_t, window_size, num_passes,
-                        mem_keys=mk, mem_vals=mv, mem_mask=mm, causal=True)
+                        mem_keys=mk, mem_vals=mv, mem_mask=mm, causal=True, stride=stride)
                     qa_logits = F.linear(qa_hidden, model.embed.weight)
                     qa_loss = F.cross_entropy(
                         qa_logits.reshape(-1, VOCAB_SIZE),
@@ -3359,7 +3374,7 @@ def train_chat(model, cfg, device, output_dir,
 
                 with amp_ctx:
                     ch_hidden = sliding_lm_encode(
-                        model, ch_inp, window_size, num_passes, causal=True)
+                        model, ch_inp, window_size, num_passes, causal=True, stride=stride)
                     ch_logits = F.linear(ch_hidden, model.embed.weight)
                     ch_loss = F.cross_entropy(
                         ch_logits.reshape(-1, VOCAB_SIZE),
@@ -3658,6 +3673,7 @@ def main():
             grad_accum=args.grad_accum,
             eval_interval=args.eval_interval,
             window_size=window_size, num_passes=num_passes,
+            stride=args.stride,
             n_wiki=args.n_wiki, n_shell=args.n_shell,
             n_qa=args.n_train, n_chat=5000,
             use_bf16=args.bf16, use_compile=args.compile,
