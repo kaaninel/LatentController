@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Micro Prototype — ~1M param memory-recall experiment.
+LatentController — 828K param looping transformer with persistent memory.
 
-Self-contained: builds tokenizer, generates dataset, trains, evaluates.
-Proves memory architecture works on extractive QA before scaling.
-Runs on MPS/CPU in ~30 minutes.
+Self-contained training pipeline: tokenizer, datasets, encoders, training, evaluation.
+Achieves 99.5% QA accuracy on bAbI memory tasks while simultaneously learning LM.
 
 Usage:
-    python train_micro.py                    # full pipeline
-    python train_micro.py --eval_only        # eval last checkpoint
-    python train_micro.py --device cpu       # force CPU
+    python train_micro.py --chunk_size 16              # QA-only training
+    python train_micro.py --chunk_size 16 --multitask  # LM + QA multi-task
+    python train_micro.py --eval_only                  # eval last checkpoint
+    python train_micro.py --device cpu                 # force CPU
 """
 
 import argparse
@@ -27,10 +27,20 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from config import MicroModelConfig, MemoryConfig
+from config import ModelConfig, MemoryConfig
 from model import LoopedLatentController
 from memory import MemorySystem
-from agent import addr_bytes, memory_vecs_to_tensor
+
+
+def addr_bytes(addr_tensor: torch.Tensor) -> bytes:
+    """Convert int8 address tensor → bytes for TrieIndex."""
+    return addr_tensor.cpu().numpy().tobytes()
+
+
+def memory_vecs_to_tensor(vecs: list, d_model: int, device) -> torch.Tensor:
+    """Convert list of int8 numpy arrays to float tensor (1, n, d_model)."""
+    out = np.stack(vecs, axis=0).astype(np.float32) / 127.0
+    return torch.from_numpy(out).unsqueeze(0).to(device)
 
 # ============================================================================
 # Verbose Logging Utilities
@@ -2727,7 +2737,7 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    cfg = MicroModelConfig()
+    cfg = ModelConfig()
     cfg.vocab_size = VOCAB_SIZE  # override with actual vocab size
     if args.chunk_size is not None:
         cfg.chunk_size = args.chunk_size

@@ -1,189 +1,280 @@
-# LatentController — Architecture Reference
+# Architecture — LatentController (828K params)
 
 ## Overview
 
-LatentController is a **looping transformer** that reconciles autoregressive generation with diffusion-style iterative refinement in latent space. The key insight is a clean separation:
-
-- **Weights** = Intelligence (how to think, pattern recognition, reasoning)
-- **Memory** = Knowledge (what was computed, facts, context)
-- **ACT** = Effort allocation (how hard to think per token)
-
-The model is a ~34M parameter decoder-only transformer that can think in loops before emitting tokens, read/write to a persistent external memory bank, and adaptively allocate compute time per token.
-
-## Core Architecture
-
-### Model Dimensions (current config)
-| Parameter | Value |
-|-----------|-------|
-| `d_model` | 512 |
-| `n_heads` | 8 |
-| `head_dim` | 64 |
-| `ffn_dim` | 2048 |
-| `n_layers` | 8 (shared weights for ACT) |
-| `max_seq_len` | 512 |
-| `vocab_size` | 16,512 (16,384 BPE + 128 reserved) |
-| `n_mem_slots` | 9 |
-| Total params | ~34M |
-
-### Forward Pass Flow
+A looping transformer with persistent external memory accessed via cross-attention.
+The model operates on raw bytes (256 vocab), uses a sliding window to encode passages
+into memory, and retrieves stored information through learned address heads.
 
 ```
-Input: token_ids (B, T_text) + optional memory_vectors (B, n_mem, d_model)
-
-1. Embed tokens → (B, T_text, d_model)
-2. If memory present:
-   - Prepend [<MEM>, vec1..vec9, </MEM>] → (B, T_text + 11, d_model)
-   - Use asymmetric mask: memory sees only memory, text sees memory + causal text
-3. Apply 8 transformer layers (RMSNorm + GQA + SiLU FFN + RoPE)
-4. Extract text_hidden = hidden[:, n_mem:, :]
-5. logits = text_hidden @ embed.weight.T
-6. halt_logits = halt_head(text_hidden) → (B, T_text, 2)
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         LatentController (828,306 params)                    │
+│                                                                             │
+│  Vocabulary: 256 (raw bytes, no tokenizer)                                  │
+│  Embedding:  256 × 128 = 32,768 params                                     │
+│  Layers:     4 × TransformerBlock = 786,960 params                          │
+│  Heads:      Halt (258) + 3×Address (3,072) + Temporal (4,096)              │
+│  Positions:  RoPE (θ=10000, up to 203 positions)                            │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Transformer Block
-- **RMSNorm** (pre-norm)
-- **Multi-head Self-Attention** with RoPE positional encoding
-- Flash Attention via PyTorch's `scaled_dot_product_attention`
-- **SiLU-gated FFN** (gate + up projections, SiLU, down projection)
-- Residual connections around both attention and FFN
+## Full Data Flow
 
-### Special Tokens
-| ID | Token | Purpose |
-|----|-------|---------|
-| 0 | `<PAD>` | Padding |
-| 1 | `<EOS>` | End of sequence |
-| 2 | `<BOS>` | Beginning of sequence |
-| 3 | `<UNK>` | Unknown |
-| 4 | `<MEM>` | Memory region start |
-| 5 | `</MEM>` | Memory region end |
-| 6 | `<NOOP>` | No operation (reserved, **not yet trained**) |
+```
+  Input: raw UTF-8 bytes
+  ┌─────────────────┐
+  │ "John is in the │    tokenize() = identity
+  │  kitchen"       │    [74, 111, 104, 110, ...]
+  └────────┬────────┘
+           │
+           ▼
+  ┌─────────────────┐     ┌──────────────────────────────────┐
+  │   Byte Embedding │     │  Sliding Window Encoder           │
+  │   256 × 128      │     │  (encodes passage into memory)    │
+  │   (32,768 params) │     │                                   │
+  └────────┬────────┘     │  chunk_size=8, stride=8            │
+           │              │  Each chunk → 2 memory vectors:    │
+           ▼              │    • mean(hidden_states)            │
+  ┌─────────────────────┐ │    • last hidden state             │
+  │                     │ │  + temporal embedding (position)   │
+  │  Transformer Stack  │◄┤                                   │
+  │  (4 layers)         │ │  Vectors quantized to int8,       │
+  │                     │ │  stored in TrieIndex by address    │
+  │  ┌───────────────┐  │ └──────────────────────────────────┘
+  │  │ Layer 0       │  │
+  │  │  ┌──────────┐ │  │     ┌──────────────────────────────┐
+  │  │  │ RMSNorm  │ │  │     │                              │
+  │  │  │ Self-Attn│ │  │     │  Persistent External Memory  │
+  │  │  │ (causal) │ │  │     │  ┌────────────────────────┐  │
+  │  │  └──────────┘ │  │     │  │ TrieIndex              │  │
+  │  │  ┌──────────┐ │  │     │  │  3 addr heads × 8 dims │  │
+  │  │  │ RMSNorm  │ │  │     │  │  ±1 neighbor search    │  │
+  │  │  │ Mem Cross│◄┼──┼─────┤  │  int8 quantized vecs   │  │
+  │  │  │ Attention│ │  │     │  │  EMA write blending     │  │
+  │  │  └──────────┘ │  │     │  └────────────────────────┘  │
+  │  │  ┌──────────┐ │  │     │                              │
+  │  │  │ RMSNorm  │ │  │     │  Read: addr_heads(hidden)    │
+  │  │  │ FFN(SiLU)│ │  │     │    → 3 addresses → lookup    │
+  │  │  └──────────┘ │  │     │    → 9 memory vectors        │
+  │  └───────────────┘  │     │    → cross-attend             │
+  │  ┌───────────────┐  │     │                              │
+  │  │ Layer 1       │  │     │  Write: encoder hidden        │
+  │  │  (same arch)  │  │     │    → quantize to int8         │
+  │  └───────────────┘  │     │    → EMA blend at address     │
+  │  ┌───────────────┐  │     └──────────────────────────────┘
+  │  │ Layer 2       │  │
+  │  │  (same arch)  │  │
+  │  └───────────────┘  │
+  │  ┌───────────────┐  │
+  │  │ Layer 3       │  │
+  │  │  (same arch)  │  │
+  │  └───────────────┘  │
+  │                     │
+  └────────┬────────────┘
+           │
+           ▼
+  ┌─────────────────┐     ┌──────────────────┐
+  │ Final RMSNorm   │     │ Halt Head        │
+  └────────┬────────┘     │ 128→2 (cont/halt)│
+           │              └──────────────────┘
+           ▼
+  ┌─────────────────┐     ┌──────────────────────────────────┐
+  │ LM Head         │     │ 3 × Address Heads                │
+  │ (embed.weight^T)│     │ each: Linear(128→8, no bias)     │
+  │ tied weights    │     │ output: int8 address for trie     │
+  └────────┬────────┘     └──────────────────────────────────┘
+           │
+           ▼
+     logits [B, T, 256]
+```
+
+## Transformer Block Detail
+
+```
+  ┌──────────────────────────────────────────────────────┐
+  │  TransformerBlock (196,740 params each × 4 layers)    │
+  │                                                       │
+  │  Input: x [B, T, 128]                                │
+  │    │                                                  │
+  │    ├──► RMSNorm ──► Self-Attention ──► + residual     │
+  │    │    (128)        Q,K,V,O: 128×128                 │
+  │    │                 4 heads × 32 dim                  │
+  │    │                 RoPE positions                    │
+  │    │                 Causal mask                       │
+  │    │                                                  │
+  │    ├──► RMSNorm ──► Memory Cross-Attention ──► + res  │
+  │    │    (128)        Q,K,V,O: 128×128                 │
+  │    │                 4 heads × 32 dim                  │
+  │    │                 Learned inv_temp per head         │
+  │    │                 Keys/Values from memory vectors   │
+  │    │                 No causal mask (full attention)   │
+  │    │                                                  │
+  │    └──► RMSNorm ──► SiLU FFN ──► + residual           │
+  │         (128)        up:  128→256 (gate + value)      │
+  │                      SiLU activation on gate           │
+  │                      down: 256→128                     │
+  └──────────────────────────────────────────────────────┘
+```
+
+## Sliding Window Encoding
+
+The encoder processes passages through a sliding window, compressing each chunk
+into memory vectors that the decoder later retrieves via cross-attention.
+
+```
+  Passage: "John went to the kitchen. Mary went to the garden."
+
+  ┌─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐
+  │ chunk 0 │ chunk 1 │ chunk 2 │ chunk 3 │ chunk 4 │ chunk 5 │
+  │ 8 bytes │ 8 bytes │ 8 bytes │ 8 bytes │ 8 bytes │ 8 bytes │
+  └────┬────┴────┬────┴────┬────┴────┬────┴────┬────┴────┬────┘
+       │         │         │         │         │         │
+       ▼         ▼         ▼         ▼         ▼         ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │           Causal Transformer Forward Pass                    │
+  │           (same model weights, sliding window)               │
+  └────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┘
+       │    │    │    │    │    │    │    │    │    │    │    │
+       ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼
+  ┌──────┐┌──────┐┌──────┐┌──────┐┌──────┐┌──────┐
+  │mean_0││last_0││mean_1││last_1││mean_2││last_2│ ...
+  │ +t_0 ││ +t_0 ││ +t_1 ││ +t_1 ││ +t_2 ││ +t_2 │
+  └──┬───┘└──┬───┘└──┬───┘└──┬───┘└──┬───┘└──┬───┘
+     │       │       │       │       │       │
+     ▼       ▼       ▼       ▼       ▼       ▼
+  ┌─────────────────────────────────────────────────┐
+  │  Memory Vector Bank (float → int8 quantized)     │
+  │  Indexed by address heads for later retrieval     │
+  │  EMA blending: v_new = α·v_write + (1-α)·v_old  │
+  └─────────────────────────────────────────────────┘
+```
 
 ## Memory System
 
-### Persistent Trie-Indexed Memory (`memory.py`)
-- 3 independent address heads, each producing an 8-dimensional int8 address
-- Trie-based indexing for fast exact + neighborhood lookup
-- int8 quantized vector storage (512 bytes per entry)
-- Adaptive EMA blending: `new_vec = alpha * incoming + (1 - alpha) * existing`
-  - Alpha decreases as write_count increases (stabilize over time)
-- Write count decay mechanism to prevent staleness
+```
+  ┌──────────────────────────────────────────────────────┐
+  │  TrieIndex — Persistent External Memory               │
+  │                                                       │
+  │  Address Space: 3 heads × 8 dims × int8 = 24 bytes   │
+  │  Vector Size:   128 dims × int8 (quantized from f32)  │
+  │                                                       │
+  │  WRITE:                                               │
+  │    hidden_state ──► addr_head(h) ──► 8-byte address   │
+  │    hidden_state ──► quantize(h * 127) ──► int8 vec    │
+  │    trie[addr] = EMA_blend(old_vec, new_vec)           │
+  │                                                       │
+  │  READ:                                                │
+  │    query_hidden ──► addr_head(h) ──► 3 addresses      │
+  │    for each address:                                  │
+  │      exact_match = trie.get(addr)                     │
+  │      neighbors   = trie.get(addr ± 1)  (±1 per dim)  │
+  │    collect up to 9 vectors (n_mem_slots)              │
+  │    return as [1, 9, 128] tensor for cross-attention   │
+  │                                                       │
+  │  Properties:                                          │
+  │    • Persistent across training steps                  │
+  │    • Content-addressed (not position-addressed)        │
+  │    • Neighbor search enables concept clustering        │
+  │    • EMA writes prevent catastrophic overwriting       │
+  │    • Decoupled from model size (can grow indefinitely) │
+  └──────────────────────────────────────────────────────┘
+```
 
-### Memory Read Flow
-1. Model produces hidden state `h`
-2. 3 address heads compute: `addr_i = round(head_i(h) * 127)` → int8 vector
-3. Each head looks up trie: exact match + ±1 neighbors in coarse dims
-4. Returns 9 memory vectors (3 heads × 3 results each)
-5. Vectors are dequantized to float and prepended to token sequence
+## Special Tokens (ASCII Control Characters)
 
-### Memory Write Flow
-1. Extract representative hidden state from middle of text sequence
-2. Compute addresses via same 3 heads
-3. Write (with EMA blending) to trie storage
-4. Write count incremented, decay applied periodically
+```
+  Hex   ASCII   Name          Role
+  ────  ─────   ────────────  ──────────────────────────
+  0x00  NUL     Null          PAD token
+  0x01  SOH     Start of Hdr  MEM_START (memory block open)
+  0x02  STX     Start of Text BOS (beginning of sequence)
+  0x03  ETX     End of Text   EOS (end of sequence)
+  0x04  EOT     End of Xmit   MEM_END (memory block close)
+  0x05  ENQ     Enquiry       ANS (answer marker in QA)
+  0x06  ACK     Acknowledge   NOOP (no output token)
+  0x1A  SUB     Substitute    UNK (unknown/fallback)
 
-## Adaptive Computation Time (ACT)
+  All other byte values (0x07-0x19, 0x1B-0xFF) = printable/UTF-8 data
+```
 
-### Training (Phase 4)
-- Shared-weight transformer blocks run multiple iterations
-- Soft halting: weighted mixture of all pondering steps
-- Ponder loss penalizes unnecessary computation
-- Curriculum: gradually increase max_steps (2→4→6) and ponder weight
+## Parameter Breakdown
 
-### Inference (Agent)
-- Hard halting: `p(halt) > threshold` → stop immediately
-- Variable compute per token based on difficulty
-- Simple tokens ("the") → 1 step; complex tokens → up to max_steps
+```
+  Component                    Parameters    % of Total
+  ─────────────────────────    ──────────    ──────────
+  Byte Embedding (256×128)       32,768        4.0%
+  Layer 0 (Self+Mem+FFN)        196,740       23.8%
+  Layer 1 (Self+Mem+FFN)        196,740       23.8%
+  Layer 2 (Self+Mem+FFN)        196,740       23.8%
+  Layer 3 (Self+Mem+FFN)        196,740       23.8%
+  Final RMSNorm                      128        0.0%
+  Halt Head (128→2)                  258        0.0%
+  Address Heads (3×128→8)          3,072        0.4%
+  Temporal Embedding (32×128)      4,096        0.5%
+  LM Head                    (tied with embed)
+  ─────────────────────────    ──────────    ──────────
+  TOTAL                          828,306      100.0%
 
-### Ponder Curriculum (Phase 4)
-| Step | max_act | ponder_weight | temperature |
-|------|---------|---------------|-------------|
-| 0 | 2 | 0.0 | 1.0 |
-| 10K | 4 | 0.0 | 1.0 |
-| 25K | 4 | 0.0005 | 1.0 |
-| 50K | 6 | 0.002 | 1.0 |
-| 80K | 6 | 0.005 | 1.0 |
-| 100K | 6 | 0.005 | 0.5 |
-| 120K | 6 | 0.005 | 0.1 |
+  Per-layer breakdown:
+    Self-Attention (Q,K,V,O)    65,536  (4 × 128×128)
+    Memory Cross-Attn (Q,K,V,O) 65,536  (4 × 128×128)
+    Memory inv_temp                  4  (learned per head)
+    FFN (up + down)             65,536  (128×256 + 256×128)
+    RMSNorm × 3                    384  (3 × 128)
+    Subtotal per layer:        196,740
+```
 
-## Hardware Adaptation
+## Training Modes
 
-### Dynamic VRAM Calibration (`hardware.py`)
-All training phases auto-calibrate batch sizes at startup via binary search:
+### QA-Only (Sliding Window + Memory)
 
-1. **`auto_calibrate_batch_size()`** — Runs trial forward+backward passes at increasing batch sizes. Finds the maximum `micro_batch` that fits within 90% of total VRAM, then adjusts `grad_accum` to maintain the target effective batch size.
-2. **`build_trial_fn()`** — Creates phase-specific trial callables. For ACT phases (4, 5), the trial uses the maximum curriculum ACT steps for safety.
-3. **`handle_oom()`** — Runtime recovery: halves `micro_batch`, doubles `grad_accum`, signals DataLoader rebuild. All 5 training loops catch `torch.cuda.OutOfMemoryError` and recover gracefully.
+```
+  Passage ──► Sliding Window Encode ──► Memory Write
+                                            │
+  Question ──► Causal Forward + MemCrossAttn ──► Answer
+                       ▲                              │
+                       └──── Memory Read (9 vecs) ◄───┘
 
-Static per-GPU configs (A100, H100, T4, etc.) serve as initial hints. Calibration always refines them.
+  Curriculum:
+    Phase A  (500 steps):  warmup, frozen encoder, passage in context
+    Phase D1 (30% steps):  no context, frozen encoder → forces memory use
+    Phase D2 (70% steps):  no context, differentiable encoder → end-to-end
+```
 
-## Training Pipeline
+### Multi-Task (LM + QA)
 
-### Phase 1: Baseline Language Model
-- Standard causal LM training on TinyStories
-- No memory, no ACT — just the transformer backbone
-- Target: 1.5B tokens, LR 3e-4 with cosine schedule
-- **Status: COMPLETE** (checkpoint on HuggingFace)
+```
+  ┌─── LM Batch ───────────────────────────────────────┐
+  │  Shell commands + Wikipedia text                     │
+  │  Standard causal forward pass (no sliding window)    │
+  │  Loss: cross-entropy on next byte prediction         │
+  └─────────────────────────────────────────────────────┘
+        ↕  alternating batches
+  ┌─── QA Batch ───────────────────────────────────────┐
+  │  bAbI memory-recall tasks (1/2/3 supporting facts)  │
+  │  Sliding window encode → memory → cross-attention    │
+  │  Loss: cross-entropy on answer tokens only           │
+  └─────────────────────────────────────────────────────┘
 
-### Phase 2: Address Head Pretraining
-- Freeze backbone, train only 3 address heads
-- Collect 800K hidden states from Phase 1 model
-- Contrastive loss: similar hidden states → similar addresses
-- Target: 10K steps
-- **Status: READY** (OOM bug fixed — on-the-fly cosine similarity)
+  Combined loss = lm_weight × LM_loss + qa_weight × QA_loss
+```
 
-### Phase 3: Memory Integration
-- Unfreeze backbone at lower LR (1e-4)
-- Live memory building: read before forward, write every 5 steps
-- Train model to use memory context for better predictions
-- Target: 2B tokens
-- **Status: READY** (per-sample memory bug fixed)
+## Configuration
 
-### Phase 4: ACT Training
-- Train adaptive computation with ponder curriculum
-- Gradually increase loop iterations and ponder penalty
-- Model learns when to think more vs. emit quickly
-- Target: 1B tokens
-- **Status: READY** (per-sample memory bug fixed)
-
-### Phase 5: Unified Streaming Training
-- Load all trained components, unfreeze address heads at 0.3× LR
-- All systems active: memory read/write + streaming ACT + backbone
-- Streaming ACT re-reads memory between ACT steps (matches agent inference)
-- Multi-position memory writes (every 64 tokens + end of sequence)
-- NOOP targets from data structure when context_column provided
-- Ponder curriculum anneals temperature to T=0.05 (near-hard halting)
-- Configurable dataset support (any HuggingFace dataset)
-- Target: 2B tokens
-- **Status: READY** (implemented in `train_phase5.py`)
-
-## Agent & Orchestrator
-
-### Agent (`agent.py`)
-- Token stream processor with rolling context buffer (max 501 tokens)
-- Calls `process_token()` for each input token
-- Uses ACT hard halting during inference
-- Integrates memory read/write per token
-- Maintains persistent hidden state `self.h` across calls
-
-### Orchestrator (`orchestrator.py`)
-- High-level API wrapping agents
-- Agent creation, feeding, text generation
-- Agent piping (A→B communication)
-- Document ingestion mode
-- Query interface with thinking budget
-
-## Design Philosophy
-
-### Why Autoregressive Shell + Diffusion Core?
-- **AR shell**: Native streaming, backspace support, proven at small scale
-- **Diffusion core**: Latent loop = denoising, iterative refinement, warm-start from memory
-- **External memory**: Infinite knowledge storage, learned addressing, multi-agent safe
-- **Action interface**: Think/read/write/lock, not just text output
-
-### Planned But Not Yet Implemented
-- **Multi-token prediction** (K=4 heads) — designed but dropped for V1 (conflicts with action tokens)
-- **Backspace tokens** (`<bs1>` through `<bs8>`) — designed, not trained
-- **Multi-agent collaboration** — orchestrator API exists, no training data
-- **True token-by-token streaming training** — Phase 5 uses full-sequence causal as approximation
-- **Hard ACT halting training** — Phase 5 anneals to near-hard (T=0.05), not truly hard
-- **HuggingFace streaming dataset** — large datasets still require full RAM load
+```python
+ModelConfig(
+    vocab_size   = 256,       # raw bytes
+    d_model      = 128,       # hidden dimension
+    n_heads      = 4,         # attention heads
+    head_dim     = 32,        # per-head dimension
+    ffn_dim      = 256,       # FFN intermediate (2× expansion)
+    n_layers     = 4,         # transformer blocks
+    max_seq_len  = 192,       # context window
+    n_mem_slots  = 9,         # memory vectors per read
+    n_addr_heads = 3,         # parallel address probes
+    addr_dim     = 8,         # address dimensionality
+    chunk_size   = 8,         # sliding window chunk size
+    slots_per_chunk = 2,      # memory entries per chunk
+    max_temporal_chunks = 32, # temporal embedding capacity
+)
+```

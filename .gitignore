@@ -9,11 +9,10 @@ build/
 .env
 .venv
 checkpoints/
-data/
 data_cache/
 memory_store/
 logs/
 *.pt
 *.bin
-conv/
-*.ipynb.DS_Store
+.DS_Store
+.cache
