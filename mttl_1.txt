@@ -1,0 +1,464 @@
+  [D1      1/10000] total=95.0242 lm=119.4641 qa=37.9977 gnorm=44.04 spd=0.0it/s lr=1.5e-06 488K tok/s VRAM=15.0GB [6s / ETA 64474s]
+  [D1     25/10000] total=88.6214 lm=116.9108 qa=22.6131 gnorm=31.68 spd=1.1it/s lr=3.7e-05 2925K tok/s VRAM=15.0GB [27s / ETA 10727s]
+  [D1     50/10000] total=69.6640 lm=94.9869 qa=10.5772 gnorm=24.28 spd=1.2it/s lr=7.5e-05 3261K tok/s VRAM=15.0GB [48s / ETA 9598s]
+  [D1     75/10000] total=27.4000 lm=36.5779 qa=5.9848 gnorm=17.49 spd=1.2it/s lr=1.1e-04 3391K tok/s VRAM=15.0GB [70s / ETA 9207s]
+  [D1    100/10000] total=10.8338 lm=14.1723 qa=3.0439 gnorm=11.71 spd=1.2it/s lr=1.5e-04 3464K tok/s VRAM=15.0GB [91s / ETA 8991s]
+  [D1    125/10000] total=4.8168 lm=5.9690 qa=2.1285 gnorm=3.40 spd=1.2it/s lr=1.9e-04 3506K tok/s VRAM=15.0GB [112s / ETA 8859s]
+  [D1    150/10000] total=3.4351 lm=4.2133 qa=1.6194 gnorm=1.31 spd=1.2it/s lr=2.2e-04 3535K tok/s VRAM=15.0GB [133s / ETA 8765s]
+  [D1    175/10000] total=2.9487 lm=3.7054 qa=1.1829 gnorm=0.96 spd=1.2it/s lr=2.6e-04 3556K tok/s VRAM=15.0GB [155s / ETA 8691s]
+  [D1    200/10000] total=2.6722 lm=3.4678 qa=0.8157 gnorm=1.59 spd=1.1it/s lr=3.0e-04 3542K tok/s VRAM=15.0GB [178s / ETA 8704s]
+  [D1    225/10000] total=2.4059 lm=3.2427 qa=0.4533 gnorm=1.50 spd=1.1it/s lr=3.0e-04 3556K tok/s VRAM=15.0GB [199s / ETA 8647s]
+  [D1    250/10000] total=2.2046 lm=3.0691 qa=0.1874 gnorm=0.91 spd=1.2it/s lr=3.0e-04 3567K tok/s VRAM=15.0GB [220s / ETA 8598s]
+  ╔══ MEMORY DIAGNOSTIC ══
+  ║ Keys:  shape=(8, 3, 128), mean=0.0716, std=1.3018, zeros=0
+  ║ Vals:  mean=0.0339, std=0.8960
+  ║ Mask:  20/24 valid (83.3%)
+  ║ dtype: keys=torch.float32, vals=torch.float32
+  ╚════════════════════════════════════════
+    1-fact: 62/82 = 75.6%
+    2-fact: 57/78 = 73.1%
+    3-fact: 29/40 = 72.5%
+
+  ╔══ EVAL @ step 250 ══
+  ║ QA Accuracy: 74.0%  (best: 74.0%)
+  ║ LM loss: 3.0691  QA loss: 0.1874
+  ║   1-fact:  62/ 82 = 75.6% ███████████████
+  ║   2-fact:  57/ 78 = 73.1% ██████████████
+  ║   3-fact:  29/ 40 = 72.5% ██████████████
+  ║ Sample: ## Alllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllll
+  ╚════════════════════════════════════════
+
+Processing Files (1 / 1)      : 100%
+ 11.3MB / 11.3MB, 11.3MB/s  
+New Data Upload               : 100%
+ 11.0MB / 11.0MB, 11.0MB/s  
+  ...titask/checkpoint_best.pt: 100%
+ 11.3MB / 11.3MB            
+    ↑ Uploaded to HF: checkpoints/multitask/checkpoint_best.pt
+  ✓ New best! QA=74.0% saved
+  [D1    275/10000] total=2.0749 lm=2.9548 qa=0.0217 gnorm=1.14 spd=0.9it/s lr=3.0e-04 3431K tok/s VRAM=15.0GB [252s / ETA 8917s]
+  [D1    300/10000] total=2.0048 lm=2.8613 qa=0.0062 gnorm=0.75 spd=0.9it/s lr=3.0e-04 3450K tok/s VRAM=15.0GB [274s / ETA 8845s]
+  [D1    325/10000] total=1.9520 lm=2.7881 qa=0.0012 gnorm=0.29 spd=1.2it/s lr=3.0e-04 3466K tok/s VRAM=15.0GB [295s / ETA 8781s]
+  [D1    350/10000] total=1.9142 lm=2.7341 qa=0.0012 gnorm=0.11 spd=1.2it/s lr=3.0e-04 3480K tok/s VRAM=15.0GB [316s / ETA 8723s]
+  [D1    375/10000] total=1.8846 lm=2.6918 qa=0.0010 gnorm=0.09 spd=1.2it/s lr=3.0e-04 3493K tok/s VRAM=15.0GB [338s / ETA 8669s]
+  [D1    400/10000] total=1.8571 lm=2.6526 qa=0.0009 gnorm=0.07 spd=1.2it/s lr=3.0e-04 3504K tok/s VRAM=15.0GB [359s / ETA 8620s]
+  [D1    425/10000] total=1.8295 lm=2.6132 qa=0.0008 gnorm=0.06 spd=1.2it/s lr=3.0e-04 3513K tok/s VRAM=15.0GB [381s / ETA 8574s]
+  [D1    450/10000] total=1.8049 lm=2.5781 qa=0.0007 gnorm=0.06 spd=1.2it/s lr=3.0e-04 3522K tok/s VRAM=15.0GB [402s / ETA 8531s]
+  [D1    475/10000] total=1.7860 lm=2.5512 qa=0.0007 gnorm=0.06 spd=1.2it/s lr=3.0e-04 3530K tok/s VRAM=15.0GB [423s / ETA 8489s]
+  [D1    500/10000] total=1.7679 lm=2.5253 qa=0.0007 gnorm=0.06 spd=1.2it/s lr=3.0e-04 3537K tok/s VRAM=15.0GB [445s / ETA 8450s]
+    1-fact: 82/82 = 100.0%
+    2-fact: 77/78 = 98.7%
+    3-fact: 40/40 = 100.0%
+
+  ╔══ EVAL @ step 500 ══
+  ║ QA Accuracy: 99.5% (+25.5%)  (best: 99.5%)
+  ║ LM loss: 2.5253  QA loss: 0.0007
+  ║   1-fact:  82/ 82 = 100.0% ████████████████████
+  ║   2-fact:  77/ 78 = 98.7% ███████████████████
+  ║   3-fact:  40/ 40 = 100.0% ████████████████████
+  ║ Sample: ## Matarittitter batat oararit it Lasttait ialitst che S t r is The ay ay eay oy te
+  ╚════════════════════════════════════════
+
+Processing Files (1 / 1)      : 100%
+ 11.3MB / 11.3MB, 11.9MB/s  
+New Data Upload               : 100%
+ 10.0MB / 10.0MB, 11.9MB/s  
+  ...titask/checkpoint_best.pt: 100%
+ 11.3MB / 11.3MB            
+    ↑ Uploaded to HF: checkpoints/multitask/checkpoint_best.pt
+  ✓ New best! QA=99.5% saved
+  [D1    525/10000] total=1.7616 lm=2.5163 qa=0.0007 gnorm=0.07 spd=0.9it/s lr=3.0e-04 3466K tok/s VRAM=15.0GB [477s / ETA 8600s]
+  [D1    550/10000] total=1.7506 lm=2.5006 qa=0.0006 gnorm=0.07 spd=0.9it/s lr=3.0e-04 3475K tok/s VRAM=15.0GB [498s / ETA 8555s]
+  [D1    575/10000] total=1.7396 lm=2.4849 qa=0.0005 gnorm=0.07 spd=1.2it/s lr=3.0e-04 3483K tok/s VRAM=15.0GB [519s / ETA 8513s]
+  [D1    600/10000] total=1.7290 lm=2.4698 qa=0.0005 gnorm=0.07 spd=1.2it/s lr=3.0e-04 3490K tok/s VRAM=15.0GB [541s / ETA 8472s]
+  [D1    625/10000] total=1.7203 lm=2.4574 qa=0.0004 gnorm=0.07 spd=1.2it/s lr=3.0e-04 3497K tok/s VRAM=15.0GB [562s / ETA 8432s]
+  [D1    650/10000] total=1.7151 lm=2.4499 qa=0.0004 gnorm=0.07 spd=1.2it/s lr=3.0e-04 3504K tok/s VRAM=15.0GB [583s / ETA 8393s]
+  [D1    675/10000] total=1.7015 lm=2.4306 qa=0.0004 gnorm=0.08 spd=1.2it/s lr=3.0e-04 3510K tok/s VRAM=15.0GB [605s / ETA 8356s]
+  [D1    700/10000] total=1.6934 lm=2.4190 qa=0.0003 gnorm=0.10 spd=1.2it/s lr=3.0e-04 3516K tok/s VRAM=15.0GB [626s / ETA 8320s]
+  [D1    725/10000] total=1.6896 lm=2.4136 qa=0.0003 gnorm=0.11 spd=1.2it/s lr=3.0e-04 3522K tok/s VRAM=15.0GB [648s / ETA 8285s]
+  [D1    750/10000] total=1.6785 lm=2.3977 qa=0.0003 gnorm=0.09 spd=1.2it/s lr=3.0e-04 3527K tok/s VRAM=15.0GB [669s / ETA 8251s]
+    1-fact: 82/82 = 100.0%
+    2-fact: 78/78 = 100.0%
+    3-fact: 40/40 = 100.0%
+
+  ╔══ EVAL @ step 750 ══
+  ║ QA Accuracy: 100.0% (+0.5%)  (best: 100.0%)
+  ║ LM loss: 2.3977  QA loss: 0.0003
+  ║   1-fact:  82/ 82 = 100.0% ████████████████████
+  ║   2-fact:  78/ 78 = 100.0% ████████████████████
+  ║   3-fact:  40/ 40 = 100.0% ████████████████████
+  ║ Sample: ## Thoyoooolloolloooooooooo rd bowoooo. thodecoroolllllollooollicclllliooos oomey o
+  ╚════════════════════════════════════════
+
+Processing Files (1 / 1)      : 100%
+ 11.3MB / 11.3MB, 11.8MB/s  
+New Data Upload               : 100%
+ 10.0MB / 10.0MB, 11.8MB/s  
+  ...titask/checkpoint_best.pt: 100%
+ 11.3MB / 11.3MB            
+    ↑ Uploaded to HF: checkpoints/multitask/checkpoint_best.pt
+  ✓ New best! QA=100.0% saved
+  [D1    775/10000] total=1.6714 lm=2.3876 qa=0.0002 gnorm=0.08 spd=0.9it/s lr=3.0e-04 3481K tok/s VRAM=15.0GB [700s / ETA 8337s]
+  [D1    800/10000] total=1.6663 lm=2.3803 qa=0.0003 gnorm=0.08 spd=0.9it/s lr=3.0e-04 3487K tok/s VRAM=15.0GB [722s / ETA 8301s]
+  [D1    825/10000] total=1.6585 lm=2.3692 qa=0.0003 gnorm=0.08 spd=1.2it/s lr=3.0e-04 3492K tok/s VRAM=15.0GB [743s / ETA 8265s]
+  [D1    850/10000] total=1.6555 lm=2.3648 qa=0.0003 gnorm=0.08 spd=1.2it/s lr=3.0e-04 3497K tok/s VRAM=15.0GB [765s / ETA 8231s]
+  [D1    875/10000] total=1.6483 lm=2.3546 qa=0.0002 gnorm=0.09 spd=1.2it/s lr=3.0e-04 3502K tok/s VRAM=15.0GB [786s / ETA 8197s]
+  [D1    900/10000] total=1.6462 lm=2.3516 qa=0.0002 gnorm=0.09 spd=1.2it/s lr=3.0e-04 3506K tok/s VRAM=15.0GB [807s / ETA 8164s]
+  [D1    925/10000] total=1.6680 lm=2.3792 qa=0.0086 gnorm=2.53 spd=1.2it/s lr=3.0e-04 3511K tok/s VRAM=15.0GB [829s / ETA 8131s]
+  [D1    950/10000] total=1.6426 lm=2.3465 qa=0.0003 gnorm=2.63 spd=1.2it/s lr=3.0e-04 3515K tok/s VRAM=15.0GB [850s / ETA 8100s]
+  [D1    975/10000] total=1.6348 lm=2.3353 qa=0.0001 gnorm=0.19 spd=1.2it/s lr=3.0e-04 3519K tok/s VRAM=15.0GB [872s / ETA 8069s]
+  [D1   1000/10000] total=1.6308 lm=2.3296 qa=0.0001 gnorm=0.09 spd=1.2it/s lr=3.0e-04 3522K tok/s VRAM=15.0GB [893s / ETA 8037s]
+    1-fact: 82/82 = 100.0%
+    2-fact: 78/78 = 100.0%
+    3-fact: 40/40 = 100.0%
+
+  ╔══ EVAL @ step 1000 ══
+  ║ QA Accuracy: 100.0% (+0.0%)  (best: 100.0%)
+  ║ LM loss: 2.3296  QA loss: 0.0001
+  ║   1-fact:  82/ 82 = 100.0% ████████████████████
+  ║   2-fact:  78/ 78 = 100.0% ████████████████████
+  ║   3-fact:  40/ 40 = 100.0% ████████████████████
+  ║ Sample: ## FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+  ╚════════════════════════════════════════
+
+Processing Files (1 / 1)      : 100%
+ 11.3MB / 11.3MB, 11.3MB/s  
+New Data Upload               : 100%
+ 10.1MB / 10.1MB, 10.0MB/s  
+  ...task/checkpoint_latest.pt: 100%
+ 11.3MB / 11.3MB            
+    ↑ Uploaded to HF: checkpoints/multitask/checkpoint_latest.pt
+  [D1   1025/10000] total=1.6245 lm=2.3207 qa=0.0001 gnorm=0.07 spd=0.9it/s lr=2.9e-04 3487K tok/s VRAM=15.0GB [925s / ETA 8097s]
+  [D1   1050/10000] total=1.6195 lm=2.3135 qa=0.0001 gnorm=0.07 spd=0.9it/s lr=2.9e-04 3491K tok/s VRAM=15.0GB [946s / ETA 8065s]
+  [D1   1075/10000] total=1.6191 lm=2.3130 qa=0.0001 gnorm=0.08 spd=1.2it/s lr=2.9e-04 3495K tok/s VRAM=15.0GB [968s / ETA 8033s]
+  [D1   1100/10000] total=1.6144 lm=2.3062 qa=0.0001 gnorm=0.09 spd=1.2it/s lr=2.9e-04 3498K tok/s VRAM=15.0GB [989s / ETA 8003s]
+  [D1   1125/10000] total=1.6104 lm=2.3006 qa=0.0001 gnorm=0.09 spd=1.2it/s lr=2.9e-04 3502K tok/s VRAM=15.0GB [1010s / ETA 7972s]
+  [D1   1150/10000] total=1.6071 lm=2.2958 qa=0.0001 gnorm=0.09 spd=1.2it/s lr=2.9e-04 3506K tok/s VRAM=15.0GB [1032s / ETA 7941s]
+  [D1   1175/10000] total=1.5996 lm=2.2851 qa=0.0001 gnorm=0.09 spd=1.2it/s lr=2.9e-04 3509K tok/s VRAM=15.0GB [1053s / ETA 7911s]
+  [D1   1200/10000] total=1.5936 lm=2.2766 qa=0.0002 gnorm=0.11 spd=1.2it/s lr=2.9e-04 3513K tok/s VRAM=15.0GB [1075s / ETA 7881s]
+  [D1   1225/10000] total=1.5859 lm=2.2655 qa=0.0002 gnorm=0.10 spd=1.2it/s lr=2.9e-04 3516K tok/s VRAM=15.0GB [1096s / ETA 7851s]
+  [D1   1250/10000] total=1.5810 lm=2.2586 qa=0.0002 gnorm=0.11 spd=1.2it/s lr=2.9e-04 3519K tok/s VRAM=15.0GB [1118s / ETA 7823s]
+    1-fact: 82/82 = 100.0%
+    2-fact: 78/78 = 100.0%
+    3-fact: 40/40 = 100.0%
+
+  ╔══ EVAL @ step 1250 ══
+  ║ QA Accuracy: 100.0% (+0.0%)  (best: 100.0%)
+  ║ LM loss: 2.2586  QA loss: 0.0002
+  ║   1-fact:  82/ 82 = 100.0% ████████████████████
+  ║   2-fact:  78/ 78 = 100.0% ████████████████████
+  ║   3-fact:  40/ 40 = 100.0% ████████████████████
+  ║ Sample: ## Thothryysthrostthe Thontestoriotre the the WWin A the The Che Foveler Corm the �
+  ╚════════════════════════════════════════
+
+  [D1   1275/10000] total=1.5753 lm=2.2503 qa=0.0002 gnorm=0.11 spd=1.0it/s lr=2.9e-04 3497K tok/s VRAM=15.0GB [1147s / ETA 7849s]
+  [D1   1300/10000] total=1.5673 lm=2.2389 qa=0.0002 gnorm=0.10 spd=1.0it/s lr=2.9e-04 3500K tok/s VRAM=15.0GB [1168s / ETA 7820s]
+  [D1   1325/10000] total=1.5616 lm=2.2308 qa=0.0002 gnorm=0.14 spd=1.2it/s lr=2.9e-04 3503K tok/s VRAM=15.0GB [1190s / ETA 7790s]
+  [D1   1350/10000] total=1.5524 lm=2.2177 qa=0.0002 gnorm=0.22 spd=1.2it/s lr=2.9e-04 3506K tok/s VRAM=15.0GB [1211s / ETA 7761s]
+  [D1   1375/10000] total=1.5425 lm=2.2036 qa=0.0002 gnorm=0.19 spd=1.2it/s lr=2.9e-04 3509K tok/s VRAM=15.0GB [1233s / ETA 7733s]
+  [D1   1400/10000] total=1.5349 lm=2.1926 qa=0.0001 gnorm=0.13 spd=1.2it/s lr=2.9e-04 3511K tok/s VRAM=15.0GB [1254s / ETA 7704s]
+  [D1   1425/10000] total=1.5247 lm=2.1781 qa=0.0001 gnorm=0.16 spd=1.2it/s lr=2.9e-04 3514K tok/s VRAM=15.0GB [1276s / ETA 7676s]
+  [D1   1450/10000] total=1.5192 lm=2.1703 qa=0.0002 gnorm=0.19 spd=1.2it/s lr=2.9e-04 3517K tok/s VRAM=15.0GB [1297s / ETA 7647s]
+  [D1   1475/10000] total=1.5102 lm=2.1573 qa=0.0001 gnorm=0.18 spd=1.2it/s lr=2.9e-04 3520K tok/s VRAM=15.0GB [1318s / ETA 7620s]
+  [D1   1500/10000] total=1.5029 lm=2.1469 qa=0.0001 gnorm=0.25 spd=1.2it/s lr=2.9e-04 3522K tok/s VRAM=15.0GB [1340s / ETA 7592s]
+    1-fact: 82/82 = 100.0%
+    2-fact: 78/78 = 100.0%
+    3-fact: 40/40 = 100.0%
+
+  ╔══ EVAL @ step 1500 ══
+  ║ QA Accuracy: 100.0% (+0.0%)  (best: 100.0%)
+  ║ LM loss: 2.1469  QA loss: 0.0001
+  ║   1-fact:  82/ 82 = 100.0% ████████████████████
+  ║   2-fact:  78/ 78 = 100.0% ████████████████████
+  ║   3-fact:  40/ 40 = 100.0% ████████████████████
+  ║ Sample: ## TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTisa wayas
+Tindaianay areestimin antiatin and f
+  ╚════════════════════════════════════════
+
+  [D1   1525/10000] total=1.4937 lm=2.1337 qa=0.0001 gnorm=0.27 spd=1.0it/s lr=2.9e-04 3503K tok/s VRAM=15.0GB [1369s / ETA 7610s]
+  [D1   1550/10000] total=1.4875 lm=2.1249 qa=0.0001 gnorm=0.19 spd=1.0it/s lr=2.9e-04 3506K tok/s VRAM=15.0GB [1391s / ETA 7582s]
+  [D1   1575/10000] total=1.4784 lm=2.1120 qa=0.0001 gnorm=0.21 spd=1.2it/s lr=2.9e-04 3508K tok/s VRAM=15.0GB [1412s / ETA 7554s]
+  [D1   1600/10000] total=1.4726 lm=2.1037 qa=0.0001 gnorm=0.23 spd=1.2it/s lr=2.9e-04 3511K tok/s VRAM=15.0GB [1434s / ETA 7527s]
+  [D1   1625/10000] total=1.4651 lm=2.0930 qa=0.0001 gnorm=0.29 spd=1.2it/s lr=2.8e-04 3513K tok/s VRAM=15.0GB [1455s / ETA 7500s]
+  [D1   1650/10000] total=1.4569 lm=2.0812 qa=0.0001 gnorm=0.30 spd=1.2it/s lr=2.8e-04 3515K tok/s VRAM=15.0GB [1477s / ETA 7472s]
+  [D1   1675/10000] total=1.4498 lm=2.0711 qa=0.0001 gnorm=0.30 spd=1.2it/s lr=2.8e-04 3517K tok/s VRAM=15.0GB [1498s / ETA 7445s]
+  [D1   1700/10000] total=1.4451 lm=2.0643 qa=0.0001 gnorm=0.33 spd=1.2it/s lr=2.8e-04 3520K tok/s VRAM=15.0GB [1519s / ETA 7418s]
+  [D1   1725/10000] total=1.4381 lm=2.0543 qa=0.0001 gnorm=0.27 spd=1.2it/s lr=2.8e-04 3522K tok/s VRAM=15.0GB [1541s / ETA 7391s]
+  [D1   1750/10000] total=1.4348 lm=2.0497 qa=0.0001 gnorm=0.31 spd=1.2it/s lr=2.8e-04 3524K tok/s VRAM=15.0GB [1562s / ETA 7365s]
+    1-fact: 82/82 = 100.0%
+    2-fact: 78/78 = 100.0%
+    3-fact: 40/40 = 100.0%
+
+  ╔══ EVAL @ step 1750 ══
+  ║ QA Accuracy: 100.0% (+0.0%)  (best: 100.0%)
+  ║ LM loss: 2.0497  QA loss: 0.0001
+  ║   1-fact:  82/ 82 = 100.0% ████████████████████
+  ║   2-fact:  78/ 78 = 100.0% ████████████████████
+  ║   3-fact:  40/ 40 = 100.0% ████████████████████
+  ║ Sample: ## TTTTTTTTTTTTTTTTTTTTTTTTTVVVelllad T; teaies fabe lad abwal farsed beat brefall 
+  ╚════════════════════════════════════════
+
+  [D1   1775/10000] total=1.4258 lm=2.0368 qa=0.0001 gnorm=0.33 spd=1.0it/s lr=2.8e-04 3508K tok/s VRAM=15.0GB [1592s / ETA 7376s]
+  [D1   1800/10000] total=1.4163 lm=2.0233 qa=0.0001 gnorm=0.30 spd=1.0it/s lr=2.8e-04 3510K tok/s VRAM=15.0GB [1613s / ETA 7349s]
+  [D1   1825/10000] total=1.4122 lm=2.0174 qa=0.0001 gnorm=0.29 spd=1.2it/s lr=2.8e-04 3512K tok/s VRAM=15.0GB [1634s / ETA 7322s]
+  [D1   1850/10000] total=1.4054 lm=2.0076 qa=0.0001 gnorm=0.30 spd=1.2it/s lr=2.8e-04 3514K tok/s VRAM=15.0GB [1656s / ETA 7295s]
+  [D1   1875/10000] total=2.6017 lm=2.0495 qa=3.8902 gnorm=4.45 spd=1.2it/s lr=2.8e-04 3516K tok/s VRAM=15.0GB [1677s / ETA 7268s]
+  [D1   1900/10000] total=1.4257 lm=2.0362 qa=0.0010 gnorm=7.88 spd=1.2it/s lr=2.8e-04 3518K tok/s VRAM=15.0GB [1699s / ETA 7242s]
+  [D1   1925/10000] total=1.3975 lm=1.9964 qa=0.0001 gnorm=3.73 spd=1.2it/s lr=2.8e-04 3520K tok/s VRAM=15.0GB [1720s / ETA 7216s]
+  [D1   1950/10000] total=1.3905 lm=1.9863 qa=0.0001 gnorm=0.22 spd=1.2it/s lr=2.8e-04 3522K tok/s VRAM=15.0GB [1742s / ETA 7189s]
+  [D1   1975/10000] total=1.3824 lm=1.9749 qa=0.0001 gnorm=0.17 spd=1.2it/s lr=2.8e-04 3524K tok/s VRAM=15.0GB [1763s / ETA 7163s]
+  [D1   2000/10000] total=1.3798 lm=1.9712 qa=0.0001 gnorm=0.20 spd=1.2it/s lr=2.8e-04 3526K tok/s VRAM=15.0GB [1784s / ETA 7137s]
+    1-fact: 81/82 = 98.8%
+    2-fact: 78/78 = 100.0%
+    3-fact: 40/40 = 100.0%
+
+  ╔══ EVAL @ step 2000 ══
+  ║ QA Accuracy: 99.5% (-0.5%)  (best: 100.0%)
+  ║ LM loss: 1.9712  QA loss: 0.0001
+  ║   1-fact:  81/ 82 = 98.8% ███████████████████
+  ║   2-fact:  78/ 78 = 100.0% ████████████████████
+  ║   3-fact:  40/ 40 = 100.0% ████████████████████
+  ║ Sample: ## JJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ
+  ╚════════════════════════════════════════
+
+Processing Files (1 / 1)      : 100%
+ 11.3MB / 11.3MB, 9.49MB/s  
+New Data Upload               : 100%
+ 10.1MB / 10.1MB, 9.49MB/s  
+  ...task/checkpoint_latest.pt: 100%
+ 11.3MB / 11.3MB            
+    ↑ Uploaded to HF: checkpoints/multitask/checkpoint_latest.pt
+  [D1   2025/10000] total=1.3730 lm=1.9614 qa=0.0001 gnorm=0.25 spd=0.9it/s lr=2.8e-04 3508K tok/s VRAM=15.0GB [1816s / ETA 7152s]
+  [D1   2050/10000] total=1.3673 lm=1.9533 qa=0.0001 gnorm=0.32 spd=0.9it/s lr=2.7e-04 3509K tok/s VRAM=15.0GB [1838s / ETA 7126s]
+  [D1   2075/10000] total=1.3708 lm=1.9583 qa=0.0001 gnorm=0.46 spd=1.2it/s lr=2.7e-04 3511K tok/s VRAM=15.0GB [1859s / ETA 7100s]
+  [D1   2100/10000] total=1.3541 lm=1.9344 qa=0.0001 gnorm=0.48 spd=1.2it/s lr=2.7e-04 3513K tok/s VRAM=15.0GB [1880s / ETA 7074s]
+  [D1   2125/10000] total=1.3485 lm=1.9264 qa=0.0001 gnorm=0.33 spd=1.2it/s lr=2.7e-04 3515K tok/s VRAM=15.0GB [1902s / ETA 7048s]
+  [D1   2150/10000] total=1.3478 lm=1.9254 qa=0.0001 gnorm=0.26 spd=1.2it/s lr=2.7e-04 3517K tok/s VRAM=15.0GB [1923s / ETA 7022s]
+  [D1   2175/10000] total=1.3402 lm=1.9145 qa=0.0001 gnorm=0.33 spd=1.2it/s lr=2.7e-04 3518K tok/s VRAM=15.0GB [1945s / ETA 6996s]
+  [D1   2200/10000] total=1.3337 lm=1.9053 qa=0.0001 gnorm=0.46 spd=1.2it/s lr=2.7e-04 3520K tok/s VRAM=15.0GB [1966s / ETA 6971s]
+  [D1   2225/10000] total=1.3287 lm=1.8981 qa=0.0001 gnorm=0.49 spd=1.2it/s lr=2.7e-04 3522K tok/s VRAM=15.0GB [1988s / ETA 6945s]
+  [D1   2250/10000] total=1.3214 lm=1.8877 qa=0.0001 gnorm=0.35 spd=1.2it/s lr=2.7e-04 3523K tok/s VRAM=15.0GB [2009s / ETA 6920s]
+    1-fact: 78/82 = 95.1%
+    2-fact: 76/78 = 97.4%
+    3-fact: 40/40 = 100.0%
+
+  ╔══ EVAL @ step 2250 ══
+  ║ QA Accuracy: 97.0% (-2.5%)  (best: 100.0%)
+  ║ LM loss: 1.8877  QA loss: 0.0001
+  ║   1-fact:  78/ 82 = 95.1% ███████████████████
+  ║   2-fact:  76/ 78 = 97.4% ███████████████████
+  ║   3-fact:  40/ 40 = 100.0% ████████████████████
+  ║ Sample: ## FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+  ╚════════════════════════════════════════
+
+  [D1   2275/10000] total=1.3188 lm=1.8840 qa=0.0001 gnorm=0.28 spd=1.0it/s lr=2.7e-04 3511K tok/s VRAM=15.0GB [2039s / ETA 6922s]
+  [D1   2300/10000] total=1.3125 lm=1.8750 qa=0.0001 gnorm=0.36 spd=1.0it/s lr=2.7e-04 3512K tok/s VRAM=15.0GB [2060s / ETA 6896s]
+  [D1   2325/10000] total=1.3066 lm=1.8665 qa=0.0001 gnorm=0.38 spd=1.2it/s lr=2.7e-04 3514K tok/s VRAM=15.0GB [2081s / ETA 6871s]
+  [D1   2350/10000] total=1.3044 lm=1.8633 qa=0.0001 gnorm=0.45 spd=1.2it/s lr=2.7e-04 3516K tok/s VRAM=15.0GB [2103s / ETA 6845s]
+  [D1   2375/10000] total=1.3063 lm=1.8662 qa=0.0001 gnorm=0.71 spd=1.2it/s lr=2.7e-04 3517K tok/s VRAM=15.0GB [2124s / ETA 6820s]
+  [D1   2400/10000] total=1.2963 lm=1.8519 qa=0.0001 gnorm=0.68 spd=1.2it/s lr=2.6e-04 3519K tok/s VRAM=15.0GB [2146s / ETA 6794s]
+  [D1   2425/10000] total=1.2874 lm=1.8391 qa=0.0001 gnorm=0.35 spd=1.2it/s lr=2.6e-04 3520K tok/s VRAM=15.0GB [2167s / ETA 6769s]
+  [D1   2450/10000] total=1.2834 lm=1.8333 qa=0.0001 gnorm=0.25 spd=1.2it/s lr=2.6e-04 3522K tok/s VRAM=15.0GB [2188s / ETA 6744s]
+  [D1   2475/10000] total=1.2799 lm=1.8284 qa=0.0001 gnorm=0.33 spd=1.1it/s lr=2.6e-04 3522K tok/s VRAM=15.0GB [2211s / ETA 6721s]
+  [D1   2500/10000] total=1.2786 lm=1.8266 qa=0.0001 gnorm=0.39 spd=1.1it/s lr=2.6e-04 3523K tok/s VRAM=15.0GB [2232s / ETA 6696s]
+    1-fact: 80/82 = 97.6%
+    2-fact: 77/78 = 98.7%
+    3-fact: 40/40 = 100.0%
+
+  ╔══ EVAL @ step 2500 ══
+  ║ QA Accuracy: 98.5% (+1.5%)  (best: 100.0%)
+  ║ LM loss: 1.8266  QA loss: 0.0001
+  ║   1-fact:  80/ 82 = 97.6% ███████████████████
+  ║   2-fact:  77/ 78 = 98.7% ███████████████████
+  ║   3-fact:  40/ 40 = 100.0% ████████████████████
+  ║ Sample: ## Ho������������������������������������������������������������������������������
+  ╚════════════════════════════════════════
+
+  [D1   2525/10000] total=1.2708 lm=1.8153 qa=0.0001 gnorm=0.42 spd=1.0it/s lr=2.6e-04 3512K tok/s VRAM=15.0GB [2262s / ETA 6696s]
+  [D1   2550/10000] total=1.2656 lm=1.8080 qa=0.0001 gnorm=0.43 spd=1.0it/s lr=2.6e-04 3513K tok/s VRAM=15.0GB [2283s / ETA 6670s]
+  [D1   2575/10000] total=1.2693 lm=1.8133 qa=0.0001 gnorm=0.55 spd=1.2it/s lr=2.6e-04 3515K tok/s VRAM=15.0GB [2305s / ETA 6645s]
+  [D1   2600/10000] total=1.2642 lm=1.8059 qa=0.0001 gnorm=0.62 spd=1.2it/s lr=2.6e-04 3516K tok/s VRAM=15.0GB [2326s / ETA 6620s]
+  [D1   2625/10000] total=1.2512 lm=1.7874 qa=0.0001 gnorm=0.46 spd=1.2it/s lr=2.6e-04 3518K tok/s VRAM=15.0GB [2347s / ETA 6595s]
+  [D1   2650/10000] total=1.2505 lm=1.7863 qa=0.0001 gnorm=0.30 spd=1.2it/s lr=2.6e-04 3519K tok/s VRAM=15.0GB [2369s / ETA 6570s]
+  [D1   2675/10000] total=1.2479 lm=1.7827 qa=0.0001 gnorm=0.33 spd=1.2it/s lr=2.6e-04 3521K tok/s VRAM=15.0GB [2390s / ETA 6545s]
+  [D1   2700/10000] total=1.2414 lm=1.7734 qa=0.0001 gnorm=0.41 spd=1.2it/s lr=2.5e-04 3522K tok/s VRAM=15.0GB [2412s / ETA 6520s]
+  [D1   2725/10000] total=1.2404 lm=1.7720 qa=0.0001 gnorm=0.45 spd=1.2it/s lr=2.5e-04 3523K tok/s VRAM=15.0GB [2433s / ETA 6495s]
+  [D1   2750/10000] total=1.2328 lm=1.7612 qa=0.0001 gnorm=0.46 spd=1.2it/s lr=2.5e-04 3525K tok/s VRAM=15.0GB [2454s / ETA 6470s]
+    1-fact: 81/82 = 98.8%
+    2-fact: 78/78 = 100.0%
+    3-fact: 40/40 = 100.0%
+
+  ╔══ EVAL @ step 2750 ══
+  ║ QA Accuracy: 99.5% (+1.0%)  (best: 100.0%)
+  ║ LM loss: 1.7612  QA loss: 0.0001
+  ║   1-fact:  81/ 82 = 98.8% ███████████████████
+  ║   2-fact:  78/ 78 = 100.0% ████████████████████
+  ║   3-fact:  40/ 40 = 100.0% ████████████████████
+  ║ Sample: ## CCEEEEEEEEEEEEEEEEEJJJJJJJJJJ72022220226745574882254512222474–222222
+
+���16//�
+  ╚════════════════════════════════════════
+
+  [D1   2775/10000] total=1.2305 lm=1.7578 qa=0.0001 gnorm=0.43 spd=1.0it/s lr=2.5e-04 3514K tok/s VRAM=15.0GB [2484s / ETA 6467s]
+  [D1   2800/10000] total=1.2231 lm=1.7473 qa=0.0001 gnorm=0.44 spd=1.0it/s lr=2.5e-04 3516K tok/s VRAM=15.0GB [2505s / ETA 6442s]
+  [D1   2825/10000] total=1.2194 lm=1.7420 qa=0.0001 gnorm=0.48 spd=1.2it/s lr=2.5e-04 3517K tok/s VRAM=15.0GB [2527s / ETA 6417s]
+  [D1   2850/10000] total=1.2120 lm=1.7315 qa=0.0001 gnorm=0.44 spd=1.2it/s lr=2.5e-04 3518K tok/s VRAM=15.0GB [2548s / ETA 6393s]
+  [D1   2875/10000] total=1.2114 lm=1.7305 qa=0.0001 gnorm=0.49 spd=1.2it/s lr=2.5e-04 3520K tok/s VRAM=15.0GB [2570s / ETA 6368s]
+  [D1   2900/10000] total=1.2052 lm=1.7216 qa=0.0001 gnorm=0.56 spd=1.2it/s lr=2.5e-04 3521K tok/s VRAM=15.0GB [2591s / ETA 6343s]
+  [D1   2925/10000] total=1.2045 lm=1.7207 qa=0.0001 gnorm=0.56 spd=1.2it/s lr=2.5e-04 3522K tok/s VRAM=15.0GB [2612s / ETA 6319s]
+  [D1   2950/10000] total=1.1994 lm=1.7133 qa=0.0001 gnorm=0.51 spd=1.2it/s lr=2.5e-04 3523K tok/s VRAM=15.0GB [2634s / ETA 6294s]
+  [D1   2975/10000] total=1.2003 lm=1.7147 qa=0.0001 gnorm=0.60 spd=1.2it/s lr=2.5e-04 3525K tok/s VRAM=15.0GB [2655s / ETA 6270s]
+
+  ═══ D1→D2 transition at step 3000 ═══
+  Encoder now differentiable — gradients flow through memory
+  [D2   3000/10000] total=1.1904 lm=1.7005 qa=0.0001 gnorm=0.66 spd=1.2it/s lr=2.4e-04 3525K tok/s VRAM=18.9GB [2677s / ETA 6246s]
+    1-fact: 79/82 = 96.3%
+    2-fact: 77/78 = 98.7%
+    3-fact: 40/40 = 100.0%
+
+  ╔══ EVAL @ step 3000 ══
+  ║ QA Accuracy: 98.0% (-1.5%)  (best: 100.0%)
+  ║ LM loss: 1.7005  QA loss: 0.0001
+  ║   1-fact:  79/ 82 = 96.3% ███████████████████
+  ║   2-fact:  77/ 78 = 98.7% ███████████████████
+  ║   3-fact:  40/ 40 = 100.0% ████████████████████
+  ║ Sample: ## JJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ
+  ╚════════════════════════════════════════
+
+Processing Files (1 / 1)      : 100%
+ 11.3MB / 11.3MB, 9.49MB/s  
+New Data Upload               : 100%
+ 10.1MB / 10.1MB, 9.49MB/s  
+  ...task/checkpoint_latest.pt: 100%
+ 11.3MB / 11.3MB            
+    ↑ Uploaded to HF: checkpoints/multitask/checkpoint_latest.pt
+  [D2   3025/10000] total=1.1872 lm=1.6959 qa=0.0001 gnorm=0.50 spd=0.9it/s lr=2.4e-04 3507K tok/s VRAM=19.0GB [2714s / ETA 6257s]
+  [D2   3050/10000] total=1.1833 lm=1.6904 qa=0.0001 gnorm=0.43 spd=0.8it/s lr=2.4e-04 3502K tok/s VRAM=19.0GB [2740s / ETA 6244s]
+  [D2   3075/10000] total=1.1814 lm=1.6877 qa=0.0001 gnorm=0.48 spd=0.9it/s lr=2.4e-04 3497K tok/s VRAM=19.0GB [2766s / ETA 6230s]
+  [D2   3100/10000] total=1.1773 lm=1.6819 qa=0.0001 gnorm=0.54 spd=0.9it/s lr=2.4e-04 3492K tok/s VRAM=19.0GB [2793s / ETA 6216s]
+  [D2   3125/10000] total=1.1727 lm=1.6752 qa=0.0001 gnorm=0.54 spd=0.9it/s lr=2.4e-04 3487K tok/s VRAM=19.0GB [2819s / ETA 6202s]
+  [D2   3150/10000] total=1.1714 lm=1.6734 qa=0.0001 gnorm=0.56 spd=0.9it/s lr=2.4e-04 3482K tok/s VRAM=19.0GB [2846s / ETA 6188s]
+  [D2   3175/10000] total=1.1660 lm=1.6656 qa=0.0001 gnorm=0.56 spd=0.9it/s lr=2.4e-04 3478K tok/s VRAM=19.0GB [2872s / ETA 6174s]
+  [D2   3200/10000] total=1.1624 lm=1.6606 qa=0.0001 gnorm=0.52 spd=0.9it/s lr=2.4e-04 3473K tok/s VRAM=19.0GB [2898s / ETA 6159s]
+  [D2   3225/10000] total=1.1584 lm=1.6548 qa=0.0001 gnorm=0.51 spd=0.9it/s lr=2.4e-04 3469K tok/s VRAM=19.0GB [2925s / ETA 6144s]
+  [D2   3250/10000] total=1.1592 lm=1.6559 qa=0.0001 gnorm=0.52 spd=0.9it/s lr=2.3e-04 3464K tok/s VRAM=19.0GB [2951s / ETA 6130s]
+    1-fact: 62/82 = 75.6%
+    2-fact: 66/78 = 84.6%
+    3-fact: 33/40 = 82.5%
+
+  ╔══ EVAL @ step 3250 ══
+  ║ QA Accuracy: 80.5% (-17.5%)  (best: 100.0%)
+  ║ LM loss: 1.6559  QA loss: 0.0001
+  ║   1-fact:  62/ 82 = 75.6% ███████████████
+  ║   2-fact:  66/ 78 = 84.6% ████████████████
+  ║   3-fact:  33/ 40 = 82.5% ████████████████
+  ║ Sample: ## 199705333322183318733, JJJ44199945– Janup//.
+Junchnen 19603 J. Hun warnns was�
+  ╚════════════════════════════════════════
+
+  [D2   3275/10000] total=1.1587 lm=1.6553 qa=0.0001 gnorm=0.56 spd=0.8it/s lr=2.3e-04 3450K tok/s VRAM=19.0GB [2986s / ETA 6131s]
+  [D2   3300/10000] total=1.1471 lm=1.6387 qa=0.0001 gnorm=0.54 spd=0.8it/s lr=2.3e-04 3446K tok/s VRAM=19.0GB [3012s / ETA 6116s]
+  [D2   3325/10000] total=1.1459 lm=1.6369 qa=0.0001 gnorm=0.50 spd=0.9it/s lr=2.3e-04 3442K tok/s VRAM=19.0GB [3039s / ETA 6100s]
+  [D2   3350/10000] total=1.1438 lm=1.6339 qa=0.0001 gnorm=0.57 spd=0.9it/s lr=2.3e-04 3438K tok/s VRAM=19.0GB [3065s / ETA 6084s]
+  [D2   3375/10000] total=1.1417 lm=1.6310 qa=0.0001 gnorm=0.51 spd=0.9it/s lr=2.3e-04 3434K tok/s VRAM=19.0GB [3091s / ETA 6068s]
+  [D2   3400/10000] total=1.1352 lm=1.6217 qa=0.0001 gnorm=0.48 spd=0.9it/s lr=2.3e-04 3430K tok/s VRAM=19.0GB [3118s / ETA 6052s]
+  [D2   3425/10000] total=1.1409 lm=1.6298 qa=0.0001 gnorm=0.63 spd=0.9it/s lr=2.3e-04 3427K tok/s VRAM=19.0GB [3144s / ETA 6036s]
+  [D2   3450/10000] total=1.1300 lm=1.6143 qa=0.0001 gnorm=0.70 spd=0.9it/s lr=2.3e-04 3423K tok/s VRAM=19.0GB [3171s / ETA 6020s]
+  [D2   3475/10000] total=1.1252 lm=1.6074 qa=0.0001 gnorm=0.61 spd=0.9it/s lr=2.3e-04 3419K tok/s VRAM=19.0GB [3197s / ETA 6003s]
+  [D2   3500/10000] total=1.1230 lm=1.6043 qa=0.0001 gnorm=0.52 spd=0.9it/s lr=2.2e-04 3416K tok/s VRAM=19.0GB [3223s / ETA 5986s]
+    1-fact: 59/82 = 72.0%
+    2-fact: 66/78 = 84.6%
+    3-fact: 30/40 = 75.0%
+
+  ╔══ EVAL @ step 3500 ══
+  ║ QA Accuracy: 77.5% (-3.0%)  (best: 100.0%)
+  ║ LM loss: 1.6043  QA loss: 0.0001
+  ║   1-fact:  59/ 82 = 72.0% ██████████████
+  ║   2-fact:  66/ 78 = 84.6% ████████████████
+  ║   3-fact:  30/ 40 = 75.0% ███████████████
+  ║ Sample: ## Mossottlisshetrallist's protincl
+  ╚════════════════════════════════════════
+
+  [D2   3525/10000] total=1.1207 lm=1.6009 qa=0.0001 gnorm=0.54 spd=0.8it/s lr=2.2e-04 3403K tok/s VRAM=19.0GB [3258s / ETA 5985s]
+  [D2   3550/10000] total=1.1154 lm=1.5934 qa=0.0001 gnorm=0.57 spd=0.8it/s lr=2.2e-04 3400K tok/s VRAM=19.0GB [3284s / ETA 5968s]
+  [D2   3575/10000] total=1.1120 lm=1.5885 qa=0.0001 gnorm=0.56 spd=0.9it/s lr=2.2e-04 3397K tok/s VRAM=19.0GB [3311s / ETA 5950s]
+  [D2   3600/10000] total=1.1105 lm=1.5863 qa=0.0001 gnorm=0.47 spd=0.9it/s lr=2.2e-04 3393K tok/s VRAM=19.0GB [3337s / ETA 5933s]
+  [D2   3625/10000] total=1.1110 lm=1.5871 qa=0.0001 gnorm=0.45 spd=0.9it/s lr=2.2e-04 3390K tok/s VRAM=19.0GB [3364s / ETA 5916s]
+  [D2   3650/10000] total=1.1072 lm=1.5817 qa=0.0001 gnorm=0.53 spd=0.9it/s lr=2.2e-04 3387K tok/s VRAM=19.0GB [3390s / ETA 5898s]
+  [D2   3675/10000] total=1.1054 lm=1.5791 qa=0.0001 gnorm=0.52 spd=0.9it/s lr=2.2e-04 3384K tok/s VRAM=19.0GB [3417s / ETA 5880s]
+  [D2   3700/10000] total=1.1015 lm=1.5736 qa=0.0001 gnorm=0.54 spd=0.9it/s lr=2.2e-04 3381K tok/s VRAM=19.0GB [3443s / ETA 5862s]
+  [D2   3725/10000] total=1.0976 lm=1.5679 qa=0.0001 gnorm=0.57 spd=0.9it/s lr=2.1e-04 3378K tok/s VRAM=19.0GB [3469s / ETA 5844s]
+  [D2   3750/10000] total=1.0930 lm=1.5613 qa=0.0001 gnorm=0.53 spd=0.9it/s lr=2.1e-04 3375K tok/s VRAM=19.0GB [3496s / ETA 5826s]
+    1-fact: 59/82 = 72.0%
+    2-fact: 66/78 = 84.6%
+    3-fact: 30/40 = 75.0%
+
+  ╔══ EVAL @ step 3750 ══
+  ║ QA Accuracy: 77.5% (+0.0%)  (best: 100.0%)
+  ║ LM loss: 1.5613  QA loss: 0.0001
+  ║   1-fact:  59/ 82 = 72.0% ██████████████
+  ║   2-fact:  66/ 78 = 84.6% ████████████████
+  ║   3-fact:  30/ 40 = 75.0% ███████████████
+  ║ Sample: ## thulllllllllllllllllllllllllllllllll/%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+  ╚════════════════════════════════════════
+
+  [D2   3775/10000] total=1.0934 lm=1.5620 qa=0.0001 gnorm=0.48 spd=0.8it/s lr=2.1e-04 3364K tok/s VRAM=19.0GB [3530s / ETA 5821s]
+  [D2   3800/10000] total=1.0897 lm=1.5567 qa=0.0001 gnorm=0.47 spd=0.8it/s lr=2.1e-04 3361K tok/s VRAM=19.0GB [3557s / ETA 5803s]
+  [D2   3825/10000] total=1.0871 lm=1.5529 qa=0.0001 gnorm=0.52 spd=0.9it/s lr=2.1e-04 3358K tok/s VRAM=19.0GB [3583s / ETA 5785s]
+  [D2   3850/10000] total=1.0834 lm=1.5477 qa=0.0001 gnorm=0.50 spd=0.9it/s lr=2.1e-04 3355K tok/s VRAM=19.0GB [3609s / ETA 5766s]
+  [D2   3875/10000] total=1.0820 lm=1.5458 qa=0.0001 gnorm=0.53 spd=0.9it/s lr=2.1e-04 3353K tok/s VRAM=19.0GB [3636s / ETA 5747s]
+  [D2   3900/10000] total=1.0816 lm=1.5451 qa=0.0001 gnorm=0.54 spd=0.9it/s lr=2.1e-04 3350K tok/s VRAM=19.0GB [3662s / ETA 5728s]
+  [D2   3925/10000] total=1.0783 lm=1.5405 qa=0.0001 gnorm=0.48 spd=0.9it/s lr=2.1e-04 3347K tok/s VRAM=19.0GB [3689s / ETA 5709s]
+  [D2   3950/10000] total=1.0744 lm=1.5348 qa=0.0001 gnorm=0.47 spd=0.9it/s lr=2.1e-04 3345K tok/s VRAM=19.0GB [3715s / ETA 5690s]
+  [D2   3975/10000] total=1.0811 lm=1.5443 qa=0.0000 gnorm=0.71 spd=0.9it/s lr=2.0e-04 3342K tok/s VRAM=19.0GB [3742s / ETA 5671s]
+  [D2   4000/10000] total=1.0705 lm=1.5292 qa=0.0001 gnorm=0.76 spd=0.9it/s lr=2.0e-04 3339K tok/s VRAM=19.0GB [3768s / ETA 5652s]
+    1-fact: 62/82 = 75.6%
+    2-fact: 68/78 = 87.2%
+    3-fact: 34/40 = 85.0%
+
+  ╔══ EVAL @ step 4000 ══
+  ║ QA Accuracy: 82.0% (+4.5%)  (best: 100.0%)
+  ║ LM loss: 1.5292  QA loss: 0.0001
+  ║   1-fact:  62/ 82 = 75.6% ███████████████
+  ║   2-fact:  68/ 78 = 87.2% █████████████████
+  ║   3-fact:  34/ 40 = 85.0% █████████████████
+  ║ Sample: ## thextoommmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm
+  ╚════════════════════════════════════════
+
+Processing Files (1 / 1)      : 100%
+ 11.3MB / 11.3MB, 11.9MB/s  
+New Data Upload               : 100%
+ 10.1MB / 10.1MB, 11.9MB/s  
+  ...task/checkpoint_latest.pt: 100%
+ 11.3MB / 11.3MB            
+    ↑ Uploaded to HF: checkpoints/multitask/checkpoint_latest.pt
+  [D2   4025/10000] total=1.0687 lm=1.5267 qa=0.0001 gnorm=0.49 spd=0.8it/s lr=2.0e-04 3328K tok/s VRAM=19.0GB [3805s / ETA 5648s]
+  [D2   4050/10000] total=1.0672 lm=1.5246 qa=0.0001 gnorm=0.42 spd=0.8it/s lr=2.0e-04 3325K tok/s VRAM=19.0GB [3831s / ETA 5628s]
+  [D2   4075/10000] total=1.0630 lm=1.5186 qa=0.0001 gnorm=0.51 spd=0.9it/s lr=2.0e-04 3323K tok/s VRAM=19.0GB [3858s / ETA 5609s]
+  [D2   4100/10000] total=1.0663 lm=1.5232 qa=0.0000 gnorm=0.58 spd=0.9it/s lr=2.0e-04 3321K tok/s VRAM=19.0GB [3884s / ETA 5589s]
+  [D2   4125/10000] total=1.0617 lm=1.5168 qa=0.0000 gnorm=0.57 spd=0.9it/s lr=2.0e-04 3318K tok/s VRAM=19.0GB [3910s / ETA 5569s]
+  [D2   4150/10000] total=1.0563 lm=1.5089 qa=0.0000 gnorm=0.54 spd=0.9it/s lr=2.0e-04 3316K tok/s VRAM=19.0GB [3937s / ETA 5550s]
+  [D2   4175/10000] total=1.0539 lm=1.5055 qa=0.0000 gnorm=0.49 spd=0.9it/s lr=1.9e-04 3314K tok/s VRAM=19.0GB [3963s / ETA 5530s]
+  [D2   4200/10000] total=1.0520 lm=1.5028 qa=0.0000 gnorm=0.51 spd=0.9it/s lr=1.9e-04 3311K tok/s VRAM=19.0GB [3990s / ETA 5510s]
+  [D2   4225/10000] total=1.0484 lm=1.4977 qa=0.0001 gnorm=0.49 spd=0.9it/s lr=1.9e-04 3309K tok/s VRAM=19.0GB [4016s / ETA 5490s]
+  [D2   4250/10000] total=1.0463 lm=1.4947 qa=0.0000 gnorm=0.53 spd=0.9it/s lr=1.9e-04 3307K tok/s VRAM=19.0GB [4043s / ETA 5469s]
+    1-fact: 64/82 = 78.0%
+    2-fact: 73/78 = 93.6%
+    3-fact: 36/40 = 90.0%
+
+  ╔══ EVAL @ step 4250 ══
+  ║ QA Accuracy: 86.5% (+4.5%)  (best: 100.0%)
+  ║ LM loss: 1.4947  QA loss: 0.0000
+  ║   1-fact:  64/ 82 = 78.0% ███████████████
+  ║   2-fact:  73/ 78 = 93.6% ██████████████████
+  ║   3-fact:  36/ 40 = 90.0% ██████████████████
+  ║ Sample: ## TVAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  ╚════════════════════════════════════════
+
+
+  ⚠ Early stopping at step 4250 (no improvement since 3000)
+  ✓ Loaded checkpoint step=750, metrics={'qa_acc': 1.0, 'lm_loss': 2.397744596004486}
+
+  Multi-task done in 4051s (67.5 min)
+  Best QA: 100.0% at step 3000
+  Peak VRAM: 19.0 GB

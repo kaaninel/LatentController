@@ -251,48 +251,113 @@ class QAExample:
 
 
 # ============================================================================
-# Source Provenance Tags — chat-like broadcast format
+# Source Provenance Tags — spatiotemporal event stream format
 # ============================================================================
-# Every fact is tagged with its source:
-#   observer/cam7@2026-03-06T10:00:00Z: mary went to the garden .
-#   news/reuters@2026-03-06T10:05:00Z: john walked to the kitchen .
+# Every event is tagged with host/user/path@timestamp:
+#   localhost/alice/chat@2026-04-07T17:04:13Z: mary went to the garden .
+#   wiki/article/earth@2026-01-01T00:00:00Z: Earth is the third planet .
+#   localhost/shell/home/project@2026-04-07T17:05:00Z: ls -la /home/user
 
-_DATAPLANES = {
-    "observer": ["cam1", "cam2", "cam3", "cam5", "cam7"],
-    "news": ["reuters", "ap", "bbc", "cnn"],
-    "social": ["alice", "bob", "charlie", "diana", "frank"],
-    "wiki": ["article", "editor1", "editor2", "bot"],
-    "shell": ["root", "admin", "deploy", "cron", "user1"],
-    "log": ["syslog", "app1", "auth", "kern"],
+# Source provenance tag format: host/user/path@timestamp: content
+# Encodes WHO (host+user) + WHERE (path) + WHEN (timestamp)
+#
+# Examples:
+#   localhost/kaaninel/~@2026-04-07T17:04:13Z: hello
+#   localhost/ant/chat@2026-04-07T17:04:14Z: hi there
+#   localhost/shell/home/project@2026-04-07T17:05:00Z: drwxr-xr-x 5 user staff
+#   wiki/article/earth@2026-01-01T00:00:00Z: Earth is the third planet.
+#   news/reuters/world@2026-03-06T10:05:00Z: Markets rose sharply today.
+
+_TAG_REGISTRY = {
+    "localhost": {
+        "users": ["alice", "bob", "charlie", "diana", "frank",
+                  "root", "admin", "deploy", "cron", "user1",
+                  "syslog", "app", "auth", "kern"],
+        "paths": ["~", "chat", "home/user", "home/project",
+                  "tmp", "var/run", "opt/app", "var/log"],
+    },
+    "server1": {
+        "users": ["root", "admin", "deploy", "cron", "app",
+                  "syslog", "auth", "kern"],
+        "paths": ["home/deploy", "var/www", "opt/service",
+                  "etc/nginx", "var/log"],
+    },
+    "wiki": {
+        "users": ["article", "editor1", "editor2", "bot"],
+        "paths": ["history", "science", "geography", "people", "culture",
+                  "technology", "nature", "politics", "mathematics", "art"],
+    },
+    "news": {
+        "users": ["reuters", "ap", "bbc", "cnn"],
+        "paths": ["world", "tech", "science", "politics", "sports"],
+    },
+    "cam1": {
+        "users": ["sensor", "feed"],
+        "paths": ["entrance", "lobby", "parking", "hallway"],
+    },
+}
+
+# Map old dataplane names to new host + user constraints
+_DOMAIN_MAP = {
+    "shell": {"hosts": ["localhost", "server1"],
+              "users": ["root", "admin", "deploy", "cron", "user1"]},
+    "wiki":  {"hosts": ["wiki"],
+              "users": ["article", "editor1", "editor2", "bot"]},
+    "news":  {"hosts": ["news"],
+              "users": ["reuters", "ap", "bbc", "cnn"]},
+    "social": {"hosts": ["localhost"],
+               "users": ["alice", "bob", "charlie", "diana", "frank"]},
+    "observer": {"hosts": ["cam1"],
+                 "users": ["sensor", "feed"]},
+    "log":   {"hosts": ["localhost", "server1"],
+              "users": ["syslog", "app", "auth", "kern"]},
 }
 
 
-def _random_tag(dataplane: str = None) -> str:
-    """Generate source tag like 'observer/cam7@2026-03-06T10:05:00Z'."""
-    if dataplane is None:
-        dataplane = random.choice(list(_DATAPLANES.keys()))
-    author = random.choice(_DATAPLANES[dataplane])
+def _random_timestamp() -> str:
     y = random.choice([2025, 2026])
     mo = random.randint(1, 12)
     d = random.randint(1, 28)
     h = random.randint(0, 23)
     mi = random.randint(0, 59)
     s = random.randint(0, 59)
-    return f"{dataplane}/{author}@{y}-{mo:02d}-{d:02d}T{h:02d}:{mi:02d}:{s:02d}Z"
+    return f"{y}-{mo:02d}-{d:02d}T{h:02d}:{mi:02d}:{s:02d}Z"
 
 
-def tag_passage(passage: str) -> str:
+def _random_tag(domain: str = None, path: str = None) -> str:
+    """Generate source tag like 'localhost/alice/~@2026-03-06T10:05:00Z'.
+
+    Args:
+        domain: Optional domain hint (shell, wiki, social, etc.)
+        path: Optional explicit path override
+    """
+    if domain and domain in _DOMAIN_MAP:
+        info = _DOMAIN_MAP[domain]
+        host = random.choice(info["hosts"])
+        user = random.choice(info["users"])
+    else:
+        host = random.choice(list(_TAG_REGISTRY.keys()))
+        user = random.choice(_TAG_REGISTRY[host]["users"])
+
+    if path is None:
+        host_paths = _TAG_REGISTRY.get(host, {}).get("paths", ["~"])
+        path = random.choice(host_paths) if host_paths else "~"
+
+    return f"{host}/{user}/{path}@{_random_timestamp()}"
+
+
+def tag_passage(passage: str, domain: str = None) -> str:
     """Tag each sentence in a passage with a source (chat-like broadcast)."""
     parts = [p.strip() for p in passage.split('.') if p.strip()]
     tagged = []
     for part in parts:
-        tagged.append(f"{_random_tag()}: {part} .")
+        tagged.append(f"{_random_tag(domain)}: {part} .")
     return '\n'.join(tagged)
 
 
-def tag_text(text: str, dataplane: str = None) -> str:
+def tag_text(text: str, domain: str = None, path: str = None) -> str:
     """Tag a single text with a source prefix."""
-    return f"{_random_tag(dataplane)}: {text}"
+    return f"{_random_tag(domain, path)}: {text}"
 
 
 def generate_single_fact() -> QAExample:
@@ -388,7 +453,7 @@ def generate_dataset(n: int, seed: int = 42, tagged: bool = False,
     """Generate n QA examples with weighted type distribution.
 
     If tagged=True, each sentence in every passage gets a source tag:
-        observer/cam7@2026-03-06T10:00:00Z: mary went to the garden .
+        localhost/alice/chat@2026-04-07T17:00:00Z: mary went to the garden .
     If include_conflicts=True, ~10% extra contradiction examples are added.
     """
     random.seed(seed)
@@ -2579,9 +2644,9 @@ def train_multitask(model, cfg, device, train_examples, val_examples,
       1. LM loss on diverse text (shell commands + Wikipedia) via sliding window
       2. QA loss on bAbI via sliding window + memory cross-attention
 
-    If tagged=True, all text is prefixed with source provenance tags:
-      shell/root@2026-04-01T14:22:33Z: ls -la /home/user
-      wiki/article@2025-06-15T08:30:00Z: The French Revolution began in 1789.
+    If tagged=True, all text is prefixed with spatiotemporal source tags:
+      localhost/root/home/user@2026-04-01T14:22:33Z: ls -la /home/user
+      wiki/article/history@2025-06-15T08:30:00Z: The French Revolution began in 1789.
     """
     print("\n" + "=" * 60)
     print("  Multi-Task Training: LM + Memory QA")
@@ -2609,8 +2674,8 @@ def train_multitask(model, cfg, device, train_examples, val_examples,
     print(f"    Wiki sentences: {len(wiki_texts)}")
 
     if tagged:
-        shell_texts = [tag_text(t, dataplane="shell") for t in shell_texts]
-        wiki_texts = [tag_text(t, dataplane="wiki") for t in wiki_texts]
+        shell_texts = [tag_text(t, domain="shell") for t in shell_texts]
+        wiki_texts = [tag_text(t, domain="wiki") for t in wiki_texts]
 
     all_lm_texts = shell_texts + wiki_texts
     random.shuffle(all_lm_texts)

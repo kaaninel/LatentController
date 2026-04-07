@@ -35,40 +35,40 @@ from train_micro import (
     VOCAB, VOCAB_SIZE, ID2WORD, PAD_ID, BOS_ID, EOS_ID, ANS_ID,
     tokenize, detokenize,
     encode_sentence_frozen, sliding_lm_encode,
-    tag_text, tag_passage, _DATAPLANES,
+    tag_text, tag_passage, _TAG_REGISTRY, _DOMAIN_MAP,
 )
 
-# Matches source provenance tags like "social/alice@2026-03-06T10:05:00Z: "
+# Matches source provenance tags: host/user/path@timestamp: content
 _TAG_RE = re.compile(
-    r'^([a-z]+)/([a-z0-9]+)@\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z: '
+    r'^([^/]+)/([^/]+)/([^@]*)@(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z): '
 )
 
-# ANSI color codes per dataplane
-_DATAPLANE_COLORS = {
-    "observer": "\033[36m",   # cyan
-    "news":     "\033[33m",   # yellow
-    "social":   "\033[35m",   # magenta
-    "wiki":     "\033[32m",   # green
-    "shell":    "\033[31m",   # red
-    "log":      "\033[34m",   # blue
+# ANSI color codes per host
+_HOST_COLORS = {
+    "localhost": "\033[35m",  # magenta
+    "server1":  "\033[36m",  # cyan
+    "wiki":     "\033[32m",  # green
+    "news":     "\033[33m",  # yellow
+    "cam1":     "\033[34m",  # blue
 }
 _RESET = "\033[0m"
 _BOLD = "\033[1m"
+_DIM = "\033[2m"
 
 
 def format_tagged_line(line: str) -> str:
     """Parse a source tag and return a color-formatted line.
 
-    Input:  'social/alice@2026-03-06T10:05:00Z: Hello world'
-    Output: '\033[1m\033[35m[social/alice]\033[0m Hello world'
+    Input:  'localhost/alice/chat@2026-04-07T17:04:13Z: Hello world'
+    Output: '\033[1m\033[35m[localhost/alice]\033[0m \033[2m~/chat\033[0m Hello world'
     """
     m = _TAG_RE.match(line)
     if not m:
         return line
-    dataplane, author = m.group(1), m.group(2)
+    host, user, path, timestamp = m.group(1), m.group(2), m.group(3), m.group(4)
     content = line[m.end():]
-    color = _DATAPLANE_COLORS.get(dataplane, "\033[37m")
-    return f"{_BOLD}{color}[{dataplane}/{author}]{_RESET} {content}"
+    color = _HOST_COLORS.get(host, "\033[37m")
+    return f"{_BOLD}{color}[{host}/{user}]{_RESET} {_DIM}{path}{_RESET} {content}"
 
 
 def load_model(checkpoint_path: str, device: str):
@@ -522,7 +522,7 @@ def main():
 
         # Text generation
         if tagged:
-            prompt_text = tag_text(user_input, dataplane="social")
+            prompt_text = tag_text(user_input, domain="social")
         else:
             prompt_text = user_input
 
