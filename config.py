@@ -169,12 +169,12 @@ class MicroModelConfig:
     head_dim: int = 32
     ffn_dim: int = 256              # 2x expansion (tiny FFN: patterns only)
     n_layers: int = 4
-    max_seq_len: int = 128
+    max_seq_len: int = 192
     dropout: float = 0.0
     rope_theta: float = 10000.0
     n_mem_slots: int = 9
     n_mem_positions: int = 11
-    n_text_positions: int = 117       # 128 - 11
+    n_text_positions: int = 181       # 192 - 11
     n_addr_heads: int = 3
     addr_dim: int = 8
     pad_id: int = 0
@@ -186,6 +186,8 @@ class MicroModelConfig:
     noop_id: int = 6
     # Cross-attention memory: Attn → MemCrossAttn → FFN per block
     use_memory_cross_attention: bool = True
+    memory_topk: int = 0            # 0=softmax, >0=top-k sparse attention with STE
+    memory_hops: int = 1            # 1=standard, 2=multi-hop (entity→attribute)
     # Streaming chunk encoding (video-frame paradigm)
     chunk_size: int = 8             # tokens per chunk (language-agnostic)
     slots_per_chunk: int = 2        # memory entries per chunk (mean + last)

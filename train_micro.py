@@ -108,7 +108,13 @@ def log_model_summary(model, cfg, label="Model"):
     print(f"  │ d_model={cfg.d_model}  n_heads={cfg.n_heads}  head_dim={cfg.head_dim}")
     print(f"  │ n_layers={cfg.n_layers}  ffn_dim={cfg.ffn_dim}  max_seq={cfg.max_seq_len}")
     max_slots = getattr(cfg, "max_memory_slots", cfg.n_mem_slots)
+    topk = getattr(cfg, "memory_topk", 0)
     print(f"  │ mem_slots={cfg.n_mem_slots}  max_memory_slots={max_slots}  addr_heads={cfg.n_addr_heads}  addr_dim={cfg.addr_dim}")
+    if topk > 0:
+        print(f"  │ memory_topk={topk} (sparse cross-attention with STE)")
+    hops = getattr(cfg, "memory_hops", 1)
+    if hops > 1:
+        print(f"  │ memory_hops={hops} (multi-hop: entity→attribute retrieval)")
     print(f"  │ params: {n_total:,} total ({n_total/1e6:.2f}M), {n_train:,} trainable")
     # Parameter breakdown by module
     embed = sum(p.numel() for n, p in model.named_parameters() if "embed" in n or "tok_emb" in n)
@@ -156,14 +162,31 @@ def log_gradient_stats(model):
     return total_norm, {k: v ** 0.5 for k, v in module_norms.items()}
 
 # ============================================================================
-# Micro Tokenizer — simple word-level, ~200 tokens
+# Byte-Level Tokenizer — UTF-8 bytes, 264 tokens total
 # ============================================================================
 
 SPECIAL_TOKENS = {
     "<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3,
-    "<mem_start>": 4, "<mem_end>": 5, "<noop>": 6,
+    "<mem_start>": 4, "<mem_end>": 5, "<noop>": 6, "<ans>": 7,
 }
+BYTE_OFFSET = len(SPECIAL_TOKENS)  # 8
+VOCAB_SIZE = 256 + BYTE_OFFSET     # 264
 
+# VOCAB dict: special tokens + single-char convenience lookups
+VOCAB = dict(SPECIAL_TOKENS)
+for _b in range(256):
+    _ch = chr(_b)
+    if _ch not in VOCAB:
+        VOCAB[_ch] = _b + BYTE_OFFSET
+
+# Reverse mapping for display
+ID2WORD = {}
+for _name, _tid in SPECIAL_TOKENS.items():
+    ID2WORD[_tid] = _name
+for _b in range(256):
+    ID2WORD[_b + BYTE_OFFSET] = chr(_b) if 32 <= _b < 127 else f'\\x{_b:02x}'
+
+# bAbI word lists — still needed for data generation
 NAMES = [
     "mary", "john", "daniel", "sandra", "fred",
     "bill", "julie", "emma", "bob", "alice",
@@ -177,40 +200,21 @@ PREPOSITIONS = ["to", "the", "in", "is", "a"]
 QUESTION_WORDS = ["where", "?"]
 PUNCTUATION = ["."]
 CONNECTORS = ["then", "after", "that"]
-ANSWER_MARKER = ["<ans>"]  # marks start of answer region
-
-def build_vocab():
-    """Build word→id and id→word mappings."""
-    vocab = dict(SPECIAL_TOKENS)
-    idx = len(vocab)
-    for group in [NAMES, LOCATIONS, VERBS, PREPOSITIONS,
-                  QUESTION_WORDS, PUNCTUATION, CONNECTORS, ANSWER_MARKER]:
-        for w in group:
-            if w not in vocab:
-                vocab[w] = idx
-                idx += 1
-    return vocab
-
-VOCAB = build_vocab()
-ID2WORD = {v: k for k, v in VOCAB.items()}
-VOCAB_SIZE = len(VOCAB)
 
 
 def tokenize(text: str) -> list[int]:
-    """Simple whitespace+punctuation tokenizer."""
-    # Split keeping punctuation as separate tokens
-    text = text.replace(".", " .").replace("?", " ?")
-    words = text.lower().split()
-    return [VOCAB.get(w, VOCAB["<unk>"]) for w in words]
+    """Encode text as UTF-8 bytes. Each byte maps to token ID = byte + BYTE_OFFSET."""
+    return [b + BYTE_OFFSET for b in text.encode('utf-8')]
 
 
 def detokenize(ids: list[int]) -> str:
-    words = [ID2WORD.get(i, "<unk>") for i in ids
-             if i not in (VOCAB["<pad>"], VOCAB["<bos>"], VOCAB["<eos>"],
-                          VOCAB["<noop>"], VOCAB["<ans>"])]
-    text = " ".join(words)
-    text = text.replace(" .", ".").replace(" ?", "?")
-    return text
+    """Decode token IDs back to text. Skips special tokens."""
+    skip = set(SPECIAL_TOKENS.values())
+    raw_bytes = bytes(
+        max(0, i - BYTE_OFFSET) for i in ids
+        if i not in skip and i >= BYTE_OFFSET
+    )
+    return raw_bytes.decode('utf-8', errors='replace')
 
 
 # ============================================================================
@@ -319,7 +323,7 @@ class ContextQADataset(Dataset):
       inp  = full[:-1]
       tgt  = [PAD...context...] answer <eos>  (PAD=ignored in loss)
     """
-    def __init__(self, examples: list[QAExample], max_len: int = 128):
+    def __init__(self, examples: list[QAExample], max_len: int = 192):
         self.samples = []
         pad = VOCAB["<pad>"]
         bos = VOCAB["<bos>"]
@@ -368,7 +372,7 @@ class MemoryQADataset(Dataset):
       passage = padded passage tokens (for memory feeding)
     """
     def __init__(self, examples: list[QAExample], max_len: int = 128,
-                 max_passage_len: int = 64):
+                 max_passage_len: int = 128):
         self.samples = []
         pad = VOCAB["<pad>"]
         bos = VOCAB["<bos>"]
@@ -746,33 +750,54 @@ def train_phase_c(model, cfg, device, examples, steps=500, lr=1e-4,
 
 def _find_entity_positions(token_ids, pad_id):
     """
-    Parse passage tokens to find per-entity key positions.
-    Returns list of (name_pos, loc_pos, period_pos) tuples, one per entity.
+    Parse passage tokens to find per-entity key positions (byte-level).
+    Returns list of (name_start, loc_start, period_pos) tuples, one per entity.
     Positions are offsets into the token_ids list (0-indexed).
     """
-    name_ids = {VOCAB[n] for n in NAMES if n in VOCAB}
-    loc_ids = {VOCAB[l] for l in LOCATIONS if l in VOCAB}
-    period_id = VOCAB.get(".", -1)
-
+    period_id = VOCAB["."]
     ids = [t for t in token_ids if t != pad_id]
+
+    # Precompute byte sequences for names/locations
+    name_seqs = {n: tokenize(n) for n in NAMES}
+    loc_seqs = {l: tokenize(l) for l in LOCATIONS}
+
+    def find_word_at(pos, word_seqs):
+        """Check if any word sequence starts at pos in ids."""
+        for word, seq in word_seqs.items():
+            if ids[pos:pos+len(seq)] == seq:
+                return word, len(seq)
+        return None, 0
+
     entities = []
     cur_name_pos = None
     cur_loc_pos = None
-
-    for i, tid in enumerate(ids):
-        if tid in name_ids:
-            cur_name_pos = i
-            cur_loc_pos = None
-        elif tid in loc_ids and cur_name_pos is not None:
-            cur_loc_pos = i
-        elif tid == period_id and cur_name_pos is not None:
+    i = 0
+    while i < len(ids):
+        if ids[i] == period_id and cur_name_pos is not None:
             entities.append((
                 cur_name_pos,
                 cur_loc_pos if cur_loc_pos is not None else i,
-                i,  # period position
+                i,
             ))
             cur_name_pos = None
             cur_loc_pos = None
+            i += 1
+            continue
+
+        word, wlen = find_word_at(i, name_seqs)
+        if word is not None:
+            cur_name_pos = i
+            cur_loc_pos = None
+            i += wlen
+            continue
+
+        word, wlen = find_word_at(i, loc_seqs)
+        if word is not None and cur_name_pos is not None:
+            cur_loc_pos = i
+            i += wlen
+            continue
+
+        i += 1
 
     return entities
 
@@ -1133,9 +1158,561 @@ def encode_enc_dec_differentiable(model, passages, device, **kwargs):
                           differentiable=True)
 
 
+# ---------------------------------------------------------------------------
+# Sliding window streaming encoder (overlapping diffusion-like context)
+# ---------------------------------------------------------------------------
+
+# Module-level stride, set from --stride CLI arg
+_SLIDING_STRIDE = 1
+
+
+def encode_sliding_window_memory(model, passages, device, window_size=8,
+                                  stride=1, differentiable=False):
+    """Sliding window streaming encoder — overlapping context windows.
+
+    Processes passage with overlapping windows that slide by `stride` tokens.
+    Each token is seen in up to `window_size // stride` windows. Like
+    neighboring cells in diffusion, overlapping views allow information
+    to propagate between tokens through iterative re-processing.
+
+    Each window cross-attends to the latest accumulated hidden states of
+    ALL previously seen tokens, creating iterative refinement:
+      Window 0: encode tokens [0..W) with no memory
+      Window 1: encode tokens [S..S+W) with cross-attn to updated [0..W)
+      Window 2: encode tokens [2S..2S+W) with cross-attn to updated [0..S+W)
+      ...
+
+    Tokens in overlapping regions get refined representations that incorporate
+    progressively richer context — the key diffusion-like property.
+
+    Returns: (keys, values, mask) for downstream QA cross-attention.
+    """
+    B = passages.size(0)
+    d_model = model.cfg.d_model
+    pad_id = VOCAB["<pad>"]
+    bos_id = VOCAB["<bos>"]
+
+    content_lens = []
+    for b in range(B):
+        clen = sum(1 for t in passages[b].tolist() if t != pad_id)
+        content_lens.append(clen)
+
+    max_clen = max(content_lens) if content_lens else 0
+    if max_clen == 0:
+        empty = torch.zeros(B, 1, d_model, device=device)
+        empty_mask = torch.zeros(B, 1, dtype=torch.bool, device=device)
+        return empty, empty.clone(), empty_mask
+
+    token_valid = torch.zeros(B, max_clen, dtype=torch.bool, device=device)
+    for b in range(B):
+        token_valid[b, :content_lens[b]] = True
+
+    # Collect hidden states per token from all window views
+    per_token_views = [[] for _ in range(max_clen)]
+
+    # Running memory: latest hidden state per token for cross-attention
+    # in subsequent windows (detached — only forward information flow)
+    running_h = torch.zeros(B, max_clen, d_model, device=device)
+    running_seen = torch.zeros(B, max_clen, dtype=torch.bool, device=device)
+
+    # Window start positions
+    win_starts = list(range(0, max(max_clen - window_size + 1, 1), stride))
+    # Ensure last window covers end of passage
+    if not win_starts or win_starts[-1] + window_size < max_clen:
+        last = max(max_clen - window_size, 0)
+        if not win_starts or last != win_starts[-1]:
+            win_starts.append(last)
+
+    max_temporal = model.temporal_emb.num_embeddings
+
+    for wi, start in enumerate(win_starts):
+        end = min(start + window_size, max_clen)
+        win_len = end - start
+
+        # Build window input: [BOS, tokens[start:end]]
+        inp = torch.full((B, win_len + 1), pad_id, dtype=torch.long, device=device)
+        win_valid = torch.zeros(B, win_len, dtype=torch.bool, device=device)
+
+        for b in range(B):
+            if start >= content_lens[b]:
+                continue
+            inp[b, 0] = bos_id
+            actual_end = min(end, content_lens[b])
+            actual_len = actual_end - start
+            inp[b, 1:actual_len + 1] = passages[b, start:actual_end]
+            win_valid[b, :actual_len] = True
+
+        # Cross-attend to running memory (all previously seen tokens)
+        # Clone to avoid in-place modification breaking autograd graph
+        if running_seen.any():
+            mem_keys = running_h.clone()
+            mem_vals = running_h.clone()
+            mem_mask = running_seen
+        else:
+            mem_keys, mem_vals, mem_mask = None, None, None
+
+        # Forward pass
+        if differentiable:
+            _, _, hidden = model(
+                inp, memory_keys=mem_keys, memory_values=mem_vals,
+                memory_mask=mem_mask, return_hidden=True)
+        else:
+            with torch.no_grad():
+                _, _, hidden = model(
+                    inp, memory_keys=mem_keys, memory_values=mem_vals,
+                    memory_mask=mem_mask, return_hidden=True)
+
+        content_h = hidden[:, 1:, :]  # (B, win_len, d_model) skip BOS
+
+        # Update running memory and collect per-token views
+        for ti in range(win_len):
+            gp = start + ti
+            if gp >= max_clen:
+                break
+            h = content_h[:, ti, :]  # (B, d_model)
+            per_token_views[gp].append(h)
+
+            # Update running memory (detached for next-window cross-attn)
+            with torch.no_grad():
+                mask_expand = win_valid[:, ti].unsqueeze(-1)  # (B, 1)
+                running_h[:, gp, :] = torch.where(
+                    mask_expand, h.detach(), running_h[:, gp, :])
+                running_seen[:, gp] = running_seen[:, gp] | win_valid[:, ti]
+
+    # Average all views per token → final memory bank
+    all_keys = []
+    all_values = []
+    for pos in range(max_clen):
+        if per_token_views[pos]:
+            stacked = torch.stack(per_token_views[pos], dim=0)  # (n_views, B, d)
+            avg_h = stacked.mean(dim=0)  # (B, d_model)
+        else:
+            avg_h = torch.zeros(B, d_model, device=device)
+
+        # Temporal embedding based on absolute position
+        chunk_idx = min(pos // window_size, max_temporal - 1)
+        t_idx = torch.tensor(chunk_idx, dtype=torch.long, device=device)
+        t_emb = model.temporal_emb(t_idx)
+
+        all_keys.append(avg_h + t_emb)
+        all_values.append(avg_h)
+
+    keys = torch.stack(all_keys, dim=1)    # (B, max_clen, d_model)
+    values = torch.stack(all_values, dim=1)  # (B, max_clen, d_model)
+
+    return keys, values, token_valid
+
+
+def encode_sliding_frozen(model, passages, device, **kwargs):
+    """Non-differentiable sliding window memory encoding."""
+    window_size = getattr(model.cfg, 'chunk_size', 8)
+    with torch.no_grad():
+        return encode_sliding_window_memory(
+            model, passages, device, window_size=window_size,
+            stride=_SLIDING_STRIDE, differentiable=False)
+
+
+def encode_sliding_differentiable(model, passages, device, **kwargs):
+    """Differentiable sliding window memory encoding."""
+    window_size = getattr(model.cfg, 'chunk_size', 8)
+    return encode_sliding_window_memory(
+        model, passages, device, window_size=window_size,
+        stride=_SLIDING_STRIDE, differentiable=True)
+
+
+# ============================================================================
+# Sliding Window LM — with Memory Cross-Attention
+# ============================================================================
+
+def sliding_lm_encode(model, input_ids, window_size=5, num_passes=4,
+                      mem_keys=None, mem_vals=None, mem_mask=None):
+    """
+    Multi-pass sliding window encoder with optional memory cross-attention.
+
+    Each pass:
+      1. Pad edges with PAD embedding (half_w each side)
+      2. Create all centered windows via unfold
+      3. Process each window through transformer layers
+         - Self-attention within window (bidirectional)
+         - Cross-attention to external memory (if provided)
+      4. Update each position's hidden from its centered window output
+
+    The memory is shared across all windows — every position can attend to it.
+    This means even with W=5 and 1 pass, the model can route through memory
+    to access any passage information, solving the receptive field problem.
+
+    Args:
+        model: LoopedLatentController (with cross-attention layers)
+        input_ids: (B, T) token IDs
+        window_size: odd integer, size of sliding window
+        num_passes: number of diffusion-like refinement passes
+        mem_keys: (B, S, d_model) memory keys or None
+        mem_vals: (B, S, d_model) memory values or None
+        mem_mask: (B, S) bool mask or None
+
+    Returns:
+        hidden: (B, T, d_model) final hidden states (norm applied)
+    """
+    B, T = input_ids.shape
+    device = input_ids.device
+    half_w = window_size // 2
+    d_model = model.cfg.d_model
+
+    # PAD embedding for edge padding
+    pad_id = torch.tensor([VOCAB["<pad>"]], device=device)
+    pad_emb = model.embed(pad_id).squeeze(0)  # (1, d_model)
+
+    # Initialize from token embeddings
+    hidden = model.embed(input_ids)  # (B, T, d_model)
+
+    # Precompute RoPE for window-relative positions (0..W-1)
+    cos = model.rope_cos[:window_size]
+    sin = model.rope_sin[:window_size]
+
+    # Bidirectional attention mask (all-to-all within window)
+    mask = torch.zeros(window_size, window_size, device=device)
+
+    # Expand memory for windowed processing: (B, S, D) → (B*T, S, D)
+    w_mem_keys, w_mem_vals, w_mem_mask = None, None, None
+    if mem_keys is not None:
+        w_mem_keys = mem_keys.unsqueeze(1).expand(-1, T, -1, -1).reshape(B * T, -1, d_model)
+        w_mem_vals = mem_vals.unsqueeze(1).expand(-1, T, -1, -1).reshape(B * T, -1, d_model)
+        if mem_mask is not None:
+            w_mem_mask = mem_mask.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)
+
+    for _ in range(num_passes):
+        # Pad edges with PAD embedding
+        pad_left = pad_emb.expand(B, half_w, d_model)
+        pad_right = pad_emb.expand(B, half_w, d_model)
+        padded = torch.cat([pad_left, hidden, pad_right], dim=1)
+
+        # Create all windows: unfold → (B, T, d_model, W) → (B, T, W, d_model)
+        windows = padded.unfold(1, window_size, 1)
+        windows = windows.permute(0, 1, 3, 2).contiguous()
+
+        # Reshape for batched layer processing: (B*T, W, d_model)
+        x = windows.reshape(B * T, window_size, d_model)
+
+        # Process through all transformer layers (self-attn + cross-attn to memory)
+        for layer in model.layers:
+            x, _ = layer(x, mask, cos, sin,
+                         mem_keys=w_mem_keys, mem_values=w_mem_vals,
+                         mem_mask=w_mem_mask)
+
+        # Extract center position outputs → new hidden states
+        centers = x[:, half_w, :]
+        hidden = centers.reshape(B, T, d_model)
+
+    return model.norm(hidden)
+
+
+@torch.no_grad()
+def evaluate_sliding_lm(model, cfg, examples, device, max_examples=200,
+                        window_size=5, num_passes=4,
+                        encode_fn=None):
+    """
+    Evaluate sliding window LM on bAbI QA.
+
+    Two modes:
+    - With encode_fn: passage encoded to memory, question processed via sliding window
+    - Without encode_fn: full sequence (passage+question) in sliding window, no memory
+    """
+    model.eval()
+
+    pad = VOCAB["<pad>"]
+    bos = VOCAB["<bos>"]
+    ans_marker = VOCAB["<ans>"]
+
+    correct = 0
+    total = 0
+    type_correct = Counter()
+    type_total = Counter()
+
+    for ex in examples[:max_examples]:
+        passage_ids = tokenize(ex.passage)
+        question_ids = tokenize(ex.question)
+        answer_ids = tokenize(ex.answer)
+
+        mem_keys, mem_vals, mem_mask = None, None, None
+        if encode_fn is not None:
+            p_tensor = torch.tensor([passage_ids], dtype=torch.long, device=device)
+            mem_keys, mem_vals, mem_mask = encode_fn(model, p_tensor, device)
+            input_ids = [bos, ans_marker] + question_ids + answer_ids
+            n_context = 2 + len(question_ids)
+        else:
+            input_ids = [bos] + passage_ids + [ans_marker] + question_ids + answer_ids
+            n_context = 1 + len(passage_ids) + 1 + len(question_ids)
+
+        input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
+
+        hidden = sliding_lm_encode(
+            model, input_tensor, window_size, num_passes,
+            mem_keys=mem_keys, mem_vals=mem_vals, mem_mask=mem_mask)
+
+        # Compute logits at all positions, check answer tokens (teacher-forced)
+        logits = F.linear(hidden, model.embed.weight)  # (1, T, vocab_size)
+        is_correct = True
+        for j, expected_byte in enumerate(answer_ids):
+            pred_pos = n_context - 1 + j
+            if logits[0, pred_pos, :].argmax().item() != expected_byte:
+                is_correct = False
+                break
+
+        if is_correct:
+            correct += 1
+        total += 1
+
+        n_facts = len(ex.facts)
+        type_total[n_facts] += 1
+        if is_correct:
+            type_correct[n_facts] += 1
+
+    accuracy = correct / max(total, 1)
+    for n_facts in sorted(type_total.keys()):
+        t_corr = type_correct[n_facts]
+        t_tot = type_total[n_facts]
+        print(f"    {n_facts}-fact: {t_corr}/{t_tot} = {t_corr/max(t_tot,1):.1%}")
+
+    model.train()
+    breakdown = {k: (type_correct[k], type_total[k]) for k in type_total}
+    return accuracy, breakdown
+
+
+def train_sliding_lm(model, cfg, device, train_examples, val_examples,
+                     output_dir, steps=3000, lr=1e-4, batch_size=32,
+                     eval_interval=200, window_size=5, num_passes=4,
+                     d1_ratio=0.3):
+    """
+    Train sliding window LM with memory for bAbI QA.
+
+    Architecture:
+      - Passage encoded to memory via existing encoder (enc_dec/sentence/streaming)
+      - Question processed through multi-pass sliding window
+      - Each window cross-attends to memory at every layer
+      - Answer predicted from last position hidden state
+
+    Training curriculum:
+      D1 (frozen encoder): teach sliding window to read from memory
+      D2 (differentiable): encoder + sliding window co-adapt
+
+    This combines the encoder-only sliding window with external memory,
+    giving each position access to the full passage through memory
+    without needing a large receptive field.
+    """
+    print("\n" + "=" * 60)
+    print("  Sliding Window LM + Memory Cross-Attention")
+    print("=" * 60)
+    print(f"  Window size:     {window_size}")
+    print(f"  Num passes:      {num_passes}")
+    print(f"  Steps:           {steps}")
+    print(f"  Batch size:      {batch_size}")
+    print(f"  LR:              {lr}")
+    print(f"  D1 ratio:        {d1_ratio:.0%}")
+
+    pad = VOCAB["<pad>"]
+    bos = VOCAB["<bos>"]
+    ans_marker = VOCAB["<ans>"]
+
+    d_model = cfg.d_model
+    chunk_size = getattr(cfg, 'chunk_size', 8)
+    slots_per_chunk = getattr(cfg, 'slots_per_chunk', 2)
+    context_fade_start = int(steps * d1_ratio)
+
+    # Use sentence encoder for memory (best previous results)
+    encode_frozen = encode_sentence_frozen
+    encode_diff = encode_sentence_differentiable
+    enc_label = "sentence-boundary (bidir per sentence)"
+    print(f"  Memory encoder:  {enc_label}")
+
+    # Pre-tokenize training data (multi-token answers with teacher forcing)
+    train_data = []
+    eos = VOCAB["<eos>"]
+    max_passage_len = 128
+    for ex in train_examples:
+        passage_ids = tokenize(ex.passage)
+        question_ids = tokenize(ex.question)
+        answer_ids = tokenize(ex.answer)
+        # Full sequence: <bos> <ans> question answer <eos>
+        full_seq = [bos, ans_marker] + question_ids + answer_ids + [eos]
+        inp_ids = full_seq[:-1]
+        n_context = 2 + len(question_ids)
+        tgt_ids = [pad] * (n_context - 1) + answer_ids + [eos]
+        assert len(inp_ids) == len(tgt_ids)
+        # Pad passage for batching
+        p_ids = passage_ids[:max_passage_len]
+        while len(p_ids) < max_passage_len:
+            p_ids.append(pad)
+        train_data.append((inp_ids, tgt_ids, p_ids))
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
+    model.train()
+
+    t0 = time.time()
+    best_acc = 0.0
+    best_step = 0
+    tracker = TrainingTracker(window=50)
+
+    # Initial memory diagnostics
+    print("\n  Initial memory encoding diagnostics:")
+    sample_passages = torch.tensor(
+        [train_data[i][2] for i in range(min(16, len(train_data)))],
+        dtype=torch.long, device=device)
+    with torch.no_grad():
+        model.eval()
+        sample_keys, sample_vals, sample_mask = encode_frozen(
+            model, sample_passages, device)
+        n_valid = sample_mask.sum(dim=1).float().mean().item()
+        print(f"  Avg valid slots: {n_valid:.1f} / {sample_keys.size(1)}")
+        log_memory_diagnostics(sample_keys, "  Init keys")
+        log_memory_diagnostics(sample_vals, "  Init vals")
+        model.train()
+
+    print(f"\n  {'─' * 56}")
+    print(f"  Training started at {time.strftime('%H:%M:%S')}")
+    print(f"  {'─' * 56}")
+
+    for step in range(1, steps + 1):
+        tracker.tick()
+
+        # Sample batch
+        batch_idx = random.sample(range(len(train_data)), batch_size)
+        batch = [train_data[i] for i in batch_idx]
+
+        # Collate inputs and targets (variable length, multi-token answers)
+        max_seq_len = max(len(b[0]) for b in batch)
+        inp_batch = []
+        tgt_batch = []
+        passage_batch = []
+
+        for inp_ids, tgt_ids, p_ids in batch:
+            padded_inp = inp_ids + [pad] * (max_seq_len - len(inp_ids))
+            padded_tgt = tgt_ids + [pad] * (max_seq_len - len(tgt_ids))
+            inp_batch.append(padded_inp)
+            tgt_batch.append(padded_tgt)
+            passage_batch.append(p_ids)
+
+        q_tensor = torch.tensor(inp_batch, dtype=torch.long, device=device)
+        tgt_tensor = torch.tensor(tgt_batch, dtype=torch.long, device=device)
+        p_tensor = torch.tensor(passage_batch, dtype=torch.long, device=device)
+
+        # LR schedule
+        lr_now = get_lr(step, 200, steps, lr, lr * 0.01)
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr_now
+
+        # Encode passage to memory
+        if step >= context_fade_start:
+            mem_keys, mem_vals, mem_mask = encode_diff(model, p_tensor, device)
+        else:
+            model.eval()
+            mem_keys, mem_vals, mem_mask = encode_frozen(model, p_tensor, device)
+            model.train()
+
+        # Forward: multi-pass sliding window with memory cross-attention
+        hidden = sliding_lm_encode(
+            model, q_tensor, window_size, num_passes,
+            mem_keys=mem_keys, mem_vals=mem_vals, mem_mask=mem_mask)
+
+        # Compute logits at all positions, loss on answer tokens only
+        logits = F.linear(hidden, model.embed.weight)  # (B, T, vocab_size)
+        loss = F.cross_entropy(
+            logits.reshape(-1, VOCAB_SIZE),
+            tgt_tensor.reshape(-1),
+            ignore_index=pad)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+
+        grad_norm, module_norms = log_gradient_stats(model)
+        tracker.add_grad_norm(grad_norm)
+        tracker.add_loss(loss.item())
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        # Logging
+        if step % 25 == 0 or step == 1:
+            elapsed = time.time() - t0
+            eta = elapsed / step * (steps - step)
+            trend = tracker.loss_trend
+            phase_tag = "D1" if step < context_fade_start else "D2*"
+            print(f"  [{phase_tag} {step:>5}/{steps}] "
+                  f"loss={loss.item():.4f} avg={tracker.avg_loss:.4f}{trend} "
+                  f"gnorm={grad_norm:.2f} lr={lr_now:.1e} "
+                  f"spd={tracker.steps_per_sec:.1f}it/s "
+                  f"[{elapsed:.0f}s / ETA {eta:.0f}s]")
+
+        # Diagnostics every 500 steps
+        if step % 500 == 0:
+            print(f"\n  ┌─── Diagnostics @ step {step} ───")
+            model.eval()
+            with torch.no_grad():
+                diag_keys, diag_vals, diag_mask = encode_frozen(
+                    model, p_tensor[:4], device)
+                n_valid = diag_mask[:4].sum(dim=1).float().mean().item()
+                print(f"  │ Valid slots: {n_valid:.1f}/{diag_keys.size(1)}")
+                log_memory_diagnostics(diag_keys, "  │ Keys")
+                log_memory_diagnostics(diag_vals, "  │ Vals")
+            model.train()
+            top_modules = sorted(module_norms.items(), key=lambda x: -x[1])[:5]
+            print(f"  │ Top grad modules: " +
+                  " ".join(f"{n}={v:.3f}" for n, v in top_modules))
+            print(f"  │ Loss: best={tracker.best_loss:.4f} "
+                  f"avg50={tracker.avg_loss:.4f}")
+            print(f"  └────────────────────\n")
+
+        # Evaluation
+        if step % eval_interval == 0 or step == steps:
+            acc, breakdown = evaluate_sliding_lm(
+                model, cfg, val_examples, device,
+                window_size=window_size, num_passes=num_passes,
+                encode_fn=encode_frozen)
+            tracker.add_eval(step, acc, breakdown)
+
+            delta = acc - tracker.eval_history[-2][1] if len(tracker.eval_history) > 1 else 0
+            delta_str = f" ({'+' if delta >= 0 else ''}{delta:.1%})" if len(tracker.eval_history) > 1 else ""
+            print(f"\n  ╔══ EVAL @ step {step} ══")
+            print(f"  ║ Accuracy: {acc:.1%}{delta_str}  (best: {tracker.best_acc:.1%})")
+            if breakdown:
+                for n_facts, (corr, tot) in sorted(breakdown.items()):
+                    bar = "█" * int(corr / max(tot, 1) * 20)
+                    print(f"  ║   {n_facts}-fact: {corr:>3}/{tot:>3} = "
+                          f"{corr/max(tot,1):.1%} {bar}")
+            print(f"  ╚{'═' * 30}\n")
+
+            if acc > best_acc:
+                best_acc = acc
+                best_step = step
+                save_path = os.path.join(output_dir, "best_sliding_lm.pt")
+                torch.save({
+                    "model": model.state_dict(),
+                    "step": step,
+                    "accuracy": acc,
+                    "vocab": VOCAB,
+                    "window_size": window_size,
+                    "num_passes": num_passes,
+                }, save_path)
+                print(f"  ✓ New best! Saved to {save_path}")
+
+            # Early stopping: no improvement for 5 evals
+            if step - best_step >= eval_interval * 5:
+                print(f"\n  ⚠ Early stopping at step {step} "
+                      f"(no improvement since step {best_step})")
+                ckpt = torch.load(
+                    os.path.join(output_dir, "best_sliding_lm.pt"),
+                    map_location=device, weights_only=True)
+                model.load_state_dict(ckpt["model"])
+                break
+
+    elapsed = time.time() - t0
+    print(f"  Sliding LM done in {elapsed:.0f}s, best accuracy={best_acc:.1%}")
+    return best_acc
+
+
 def train_phase_d(model, cfg, device, train_examples, val_examples,
                   memory_dir, steps=3000, lr=1e-4, batch_size=16,
-                  max_len=128, eval_interval=200, encoder_mode='enc_dec'):
+                  max_len=128, eval_interval=200, encoder_mode='enc_dec',
+                  d1_ratio=0.2):
     """
     Memory-dependent QA with encoder-decoder architecture.
 
@@ -1157,7 +1734,7 @@ def train_phase_d(model, cfg, device, train_examples, val_examples,
     d_model = cfg.d_model
     chunk_size = getattr(cfg, 'chunk_size', 8)
     slots_per_chunk = getattr(cfg, 'slots_per_chunk', 2)
-    context_fade_start = int(steps * 0.2)
+    context_fade_start = int(steps * d1_ratio)
 
     # Select encoder functions based on mode
     if encoder_mode == 'enc_dec':
@@ -1168,6 +1745,10 @@ def train_phase_d(model, cfg, device, train_examples, val_examples,
         encode_frozen = encode_sentence_frozen
         encode_diff = encode_sentence_differentiable
         enc_label = "sentence-boundary (bidir per sentence)"
+    elif encoder_mode == 'sliding':
+        encode_frozen = encode_sliding_frozen
+        encode_diff = encode_sliding_differentiable
+        enc_label = f"sliding window (win={chunk_size}, stride={_SLIDING_STRIDE})"
     else:
         encode_frozen = lambda m, p, d, **kw: encode_kv_memory_chunked(
             m, p, d, chunk_size, slots_per_chunk)
@@ -1387,13 +1968,17 @@ def evaluate_memory_qa(model, cfg, examples, device, max_examples=200,
         elif encoder_mode == 'sentence':
             mem_keys, mem_vals, mem_mask = encode_sentence_frozen(
                 model, p_tensor, device)
+        elif encoder_mode == 'sliding':
+            mem_keys, mem_vals, mem_mask = encode_sliding_frozen(
+                model, p_tensor, device)
         else:
             mem_keys, mem_vals, mem_mask = encode_kv_memory_chunked(
                 model, p_tensor, device, chunk_size, slots_per_chunk)
 
-        # Build question input
+        # Build question input with answer tokens (teacher-forced evaluation)
         question_ids = tokenize(ex.question)
-        inp_ids = [VOCAB["<bos>"], VOCAB["<ans>"]] + question_ids
+        answer_ids = tokenize(ex.answer)
+        inp_ids = [VOCAB["<bos>"], VOCAB["<ans>"]] + question_ids + answer_ids
         inp = torch.tensor([inp_ids], dtype=torch.long, device=device)
 
         logits, _, hidden = model(inp, memory_keys=mem_keys,
@@ -1401,9 +1986,14 @@ def evaluate_memory_qa(model, cfg, examples, device, max_examples=200,
                                    memory_mask=mem_mask,
                                    return_hidden=True)
 
-        pred_id = logits[0, -1, :].argmax().item()
-        expected_id = VOCAB.get(ex.answer, -1)
-        is_correct = pred_id == expected_id
+        # Check predictions at each answer position (teacher-forced)
+        n_context = 2 + len(question_ids)
+        is_correct = True
+        for j, expected_byte in enumerate(answer_ids):
+            pred_pos = n_context - 1 + j
+            if logits[0, pred_pos, :].argmax().item() != expected_byte:
+                is_correct = False
+                break
 
         if is_correct:
             correct += 1
@@ -1439,17 +2029,25 @@ def evaluate_context_qa(model, cfg, examples, device, max_examples=200):
     for ex in examples[:max_examples]:
         passage_ids = tokenize(ex.passage)
         question_ids = tokenize(ex.question)
+        answer_ids = tokenize(ex.answer)
 
         bos = VOCAB["<bos>"]
         ans_marker = VOCAB["<ans>"]
-        inp_ids = [bos] + passage_ids + [ans_marker] + question_ids
+        inp_ids = [bos] + passage_ids + [ans_marker] + question_ids + answer_ids
         inp = torch.tensor([inp_ids], dtype=torch.long, device=device)
 
         logits, _ = model(inp)
-        pred_id = logits[0, -1, :].argmax().item()
 
-        expected_id = VOCAB.get(ex.answer, -1)
-        if pred_id == expected_id:
+        # Teacher-forced multi-token comparison
+        n_context = 1 + len(passage_ids) + 1 + len(question_ids)
+        is_correct = True
+        for j, expected_byte in enumerate(answer_ids):
+            pred_pos = n_context - 1 + j
+            if logits[0, pred_pos, :].argmax().item() != expected_byte:
+                is_correct = False
+                break
+
+        if is_correct:
             correct += 1
         total += 1
 
@@ -1479,13 +2077,17 @@ def detailed_eval(model, cfg, examples, device, n=10, encoder_mode='enc_dec'):
             elif encoder_mode == 'sentence':
                 mem_keys, mem_vals, mem_mask = encode_sentence_frozen(
                     model, p_tensor, device)
+            elif encoder_mode == 'sliding':
+                mem_keys, mem_vals, mem_mask = encode_sliding_frozen(
+                    model, p_tensor, device)
             else:
                 mem_keys, mem_vals, mem_mask = encode_kv_memory_chunked(
                     model, p_tensor, device, chunk_size, slots_per_chunk)
 
-        # Question input
+        # Question input with answer tokens (teacher-forced)
         question_ids = tokenize(ex.question)
-        inp_ids = [VOCAB["<bos>"], VOCAB["<ans>"]] + question_ids
+        answer_ids = tokenize(ex.answer)
+        inp_ids = [VOCAB["<bos>"], VOCAB["<ans>"]] + question_ids + answer_ids
         inp = torch.tensor([inp_ids], dtype=torch.long, device=device)
 
         with torch.no_grad():
@@ -1498,25 +2100,30 @@ def detailed_eval(model, cfg, examples, device, n=10, encoder_mode='enc_dec'):
             # Without memory
             logits_no_mem, _ = model(inp)
 
-        pred_mem = logits_mem[0, -1, :].argmax().item()
-        pred_no_mem = logits_no_mem[0, -1, :].argmax().item()
+        # Decode predicted answer bytes (teacher-forced)
+        n_context = 2 + len(question_ids)
+        pred_mem_ids = [logits_mem[0, n_context - 1 + j, :].argmax().item()
+                        for j in range(len(answer_ids))]
+        pred_no_mem_ids = [logits_no_mem[0, n_context - 1 + j, :].argmax().item()
+                           for j in range(len(answer_ids))]
+        pred_mem_str = detokenize(pred_mem_ids)
+        pred_no_mem_str = detokenize(pred_no_mem_ids)
 
-        # Top-5 with memory
-        top5_vals, top5_ids = logits_mem[0, -1, :].topk(5)
+        # Top-5 for first answer byte position
+        top5_vals, top5_ids = logits_mem[0, n_context - 1, :].topk(5)
         top5_probs = F.softmax(top5_vals, dim=0)
-        top5_words = [(ID2WORD.get(idx.item(), "?"), f"{p.item():.3f}")
-                      for idx, p in zip(top5_ids, top5_probs)]
+        top5_tokens = [(ID2WORD.get(idx.item(), "?"), f"{p.item():.3f}")
+                       for idx, p in zip(top5_ids, top5_probs)]
 
         expected = ex.answer
-        mark = "✓" if ID2WORD.get(pred_mem, "") == expected else "✗"
+        mark = "✓" if pred_mem_str == expected else "✗"
 
         print(f"\n  {mark} Example {i+1}:")
         print(f"    Passage:  {ex.passage}")
         print(f"    Question: {ex.question}")
         print(f"    Expected: {expected}")
-        print(f"    With mem: {ID2WORD.get(pred_mem, '?')} | "
-              f"No mem: {ID2WORD.get(pred_no_mem, '?')}")
-        print(f"    Top-5:    {top5_words}")
+        print(f"    With mem: {pred_mem_str} | No mem: {pred_no_mem_str}")
+        print(f"    Top-5 (1st byte): {top5_tokens}")
         print(f"    Mem: {n_valid} slots, avg_norm={avg_norm:.2f}")
 
     model.train()
@@ -1542,10 +2149,20 @@ def main():
     parser.add_argument("--phase_c_steps", type=int, default=500)
     parser.add_argument("--phase_d_steps", type=int, default=3000)
     parser.add_argument("--encoder_mode", default="sentence",
-                        choices=["enc_dec", "streaming", "sentence"],
-                        help="Memory encoder: sentence (sentence-boundary bidir), enc_dec (multi-iter bidir), or streaming (chunked)")
+                        choices=["enc_dec", "streaming", "sentence", "sliding", "sliding_lm"],
+                        help="Memory encoder, or 'sliding_lm' for encoder-only (no decoder/memory)")
+    parser.add_argument("--num_passes", type=int, default=4,
+                        help="Number of diffusion passes for sliding_lm mode")
     parser.add_argument("--chunk_size", type=int, default=None,
-                        help="Override chunk_size for streaming encoder")
+                        help="Override chunk_size / window_size for encoder")
+    parser.add_argument("--stride", type=int, default=1,
+                        help="Stride for sliding window encoder (1=token-by-token)")
+    parser.add_argument("--memory_topk", type=int, default=0,
+                        help="Top-K sparse cross-attention (0=softmax, >0=top-k with STE)")
+    parser.add_argument("--memory_hops", type=int, default=1,
+                        help="Cross-attention hops (1=standard, 2=multi-hop entity→attribute)")
+    parser.add_argument("--d1_ratio", type=float, default=0.2,
+                        help="Fraction of Phase D steps for D1 (frozen encoder)")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -1563,6 +2180,10 @@ def main():
     print("  MICRO PROTOTYPE — Memory Recall Experiment")
     print("=" * 60)
 
+    # Set sliding window stride from CLI
+    global _SLIDING_STRIDE
+    _SLIDING_STRIDE = args.stride
+
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -1571,8 +2192,12 @@ def main():
     cfg.vocab_size = VOCAB_SIZE  # override with actual vocab size
     if args.chunk_size is not None:
         cfg.chunk_size = args.chunk_size
+    if args.memory_topk > 0:
+        cfg.memory_topk = args.memory_topk
+    if args.memory_hops > 1:
+        cfg.memory_hops = args.memory_hops
     print(f"  Device:     {device}")
-    print(f"  Vocab:      {VOCAB_SIZE} words")
+    print(f"  Vocab:      {VOCAB_SIZE} tokens (byte-level UTF-8)")
 
     model = LoopedLatentController(cfg, use_checkpoint=False).to(device)
     n_params = count_params(model)
@@ -1620,83 +2245,142 @@ def main():
 
     # ===== Full Training Pipeline =====
     t_start = time.time()
-    print("\n" + "─" * 60)
-    print(f"  Pipeline: A({args.phase_a_steps}) → B({args.phase_b_steps}) "
-          f"→ C({args.phase_c_steps}) → D({args.phase_d_steps})")
-    print("─" * 60)
 
-    # Phase A: Warmup LM
-    loss_a = train_phase_a(model, cfg, device, train_examples,
-                           steps=args.phase_a_steps, batch_size=64)
+    if args.encoder_mode == 'sliding_lm':
+        # ── Sliding window LM with memory cross-attention ──
+        window_size = cfg.chunk_size if args.chunk_size is not None else 5
+        num_passes = args.num_passes
 
-    # Quick context QA check
-    print("\n  Context QA after Phase A:")
-    ctx_acc_a = evaluate_context_qa(model, cfg, val_examples, device)
-    print(f"  → {ctx_acc_a:.1%}")
+        print("\n" + "─" * 60)
+        print(f"  Pipeline: A({args.phase_a_steps}) → SlidingLM({args.phase_d_steps})")
+        print("─" * 60)
 
-    # Phase B: Address heads
-    train_phase_b(model, cfg, device, train_examples,
-                  steps=args.phase_b_steps, batch_size=128)
+        # Phase A: LM warmup (teaches embeddings + basic attention)
+        loss_a = train_phase_a(model, cfg, device, train_examples,
+                               steps=args.phase_a_steps, batch_size=64)
 
-    # Phase C: ACT curriculum
-    train_phase_c(model, cfg, device, train_examples,
-                  steps=args.phase_c_steps, batch_size=64)
+        print("\n  Context QA after Phase A:")
+        ctx_acc_a = evaluate_context_qa(model, cfg, val_examples, device)
+        print(f"  → {ctx_acc_a:.1%}")
 
-    # Quick context QA check
-    print("\n  Context QA after Phase C:")
-    ctx_acc_c = evaluate_context_qa(model, cfg, val_examples, device)
-    print(f"  → {ctx_acc_c:.1%}")
+        # Sliding LM training with memory (replaces B/C/D)
+        slm_dir = os.path.join(args.output_dir, "sliding_lm")
+        os.makedirs(slm_dir, exist_ok=True)
+        best_acc = train_sliding_lm(
+            model, cfg, device, train_examples, val_examples, slm_dir,
+            steps=args.phase_d_steps, lr=1e-4, batch_size=32,
+            eval_interval=200,
+            window_size=window_size, num_passes=num_passes,
+            d1_ratio=args.d1_ratio,
+        )
 
-    # Memory QA baseline (before Phase D)
-    print("\n  Memory QA BEFORE Phase D (random baseline):")
-    pre_d_acc = evaluate_memory_qa(model, cfg, val_examples, device,
-                                   max_examples=200,
-                                   encoder_mode=args.encoder_mode)
-    print(f"  → {pre_d_acc:.1%}")
+        # Final report
+        total_time = time.time() - t_start
+        print("\n" + "=" * 60)
+        print("  FINAL REPORT — Sliding Window LM + Memory")
+        print("=" * 60)
+        print(f"  Total time:      {total_time:.0f}s ({total_time/60:.1f} min)")
+        print(f"  Parameters:      {n_params:,}")
+        print(f"  Window size:     {window_size}")
+        print(f"  Num passes:      {num_passes}")
+        print(f"  Context QA:      {ctx_acc_a:.1%} (after Phase A)")
+        print(f"  Sliding LM QA:   {best_acc:.1%}")
+        print(f"  Target:          >80% QA accuracy")
 
-    # Phase D: Memory QA (the real test)
-    mem_dir = os.path.join(args.output_dir, "memory")
-    os.makedirs(mem_dir, exist_ok=True)
-    best_acc = train_phase_d(
-        model, cfg, device, train_examples, val_examples, mem_dir,
-        steps=args.phase_d_steps, lr=1e-4, batch_size=32,
-        eval_interval=200, encoder_mode=args.encoder_mode,
-    )
+        report = {
+            "total_time_s": total_time,
+            "n_params": n_params,
+            "mode": "sliding_lm",
+            "window_size": window_size,
+            "num_passes": num_passes,
+            "context_qa_acc": ctx_acc_a,
+            "sliding_lm_acc": best_acc,
+            "config": {
+                "d_model": cfg.d_model, "n_layers": cfg.n_layers,
+                "n_heads": cfg.n_heads, "vocab_size": VOCAB_SIZE,
+            },
+            "device": device,
+        }
+    else:
+        # ── Standard encoder-decoder pipeline ──
+        print("\n" + "─" * 60)
+        print(f"  Pipeline: A({args.phase_a_steps}) → B({args.phase_b_steps}) "
+              f"→ C({args.phase_c_steps}) → D({args.phase_d_steps})")
+        print("─" * 60)
 
-    # Final report
-    total_time = time.time() - t_start
-    print("\n" + "=" * 60)
-    print("  FINAL REPORT")
-    print("=" * 60)
-    print(f"  Total time:      {total_time:.0f}s ({total_time/60:.1f} min)")
-    print(f"  Parameters:      {n_params:,}")
-    print(f"  Context QA:      {ctx_acc_c:.1%} (passage in context)")
-    print(f"  Memory QA:       {best_acc:.1%} (passage from memory)")
-    print(f"  Target:          >80% memory QA")
-    print(f"  ACT fix:         halt bias [0,0] (50/50 init)")
+        # Phase A: Warmup LM
+        loss_a = train_phase_a(model, cfg, device, train_examples,
+                               steps=args.phase_a_steps, batch_size=64)
 
-    # Detailed eval
-    detailed_eval(model, cfg, val_examples, device, n=10,
-                  encoder_mode=args.encoder_mode)
+        # Quick context QA check
+        print("\n  Context QA after Phase A:")
+        ctx_acc_a = evaluate_context_qa(model, cfg, val_examples, device)
+        print(f"  → {ctx_acc_a:.1%}")
 
-    # Save final report
-    report = {
-        "total_time_s": total_time,
-        "n_params": n_params,
-        "context_qa_acc": ctx_acc_c,
-        "memory_qa_acc": best_acc,
-        "phases": {
-            "A": {"steps": args.phase_a_steps, "final_loss": loss_a},
-            "B": {"steps": args.phase_b_steps},
-            "C": {"steps": args.phase_c_steps, "context_qa": ctx_acc_c},
-            "D": {"steps": args.phase_d_steps, "best_acc": best_acc},
-        },
-        "config": {
-            "d_model": cfg.d_model, "n_layers": cfg.n_layers,
-            "n_heads": cfg.n_heads, "vocab_size": VOCAB_SIZE,
-        },
-        "device": device,
-    }
+        # Phase B: Address heads
+        train_phase_b(model, cfg, device, train_examples,
+                      steps=args.phase_b_steps, batch_size=128)
+
+        # Phase C: ACT curriculum
+        train_phase_c(model, cfg, device, train_examples,
+                      steps=args.phase_c_steps, batch_size=64)
+
+        # Quick context QA check
+        print("\n  Context QA after Phase C:")
+        ctx_acc_c = evaluate_context_qa(model, cfg, val_examples, device)
+        print(f"  → {ctx_acc_c:.1%}")
+
+        # Memory QA baseline (before Phase D)
+        print("\n  Memory QA BEFORE Phase D (random baseline):")
+        pre_d_acc = evaluate_memory_qa(model, cfg, val_examples, device,
+                                       max_examples=200,
+                                       encoder_mode=args.encoder_mode)
+        print(f"  → {pre_d_acc:.1%}")
+
+        # Phase D: Memory QA (the real test)
+        mem_dir = os.path.join(args.output_dir, "memory")
+        os.makedirs(mem_dir, exist_ok=True)
+        best_acc = train_phase_d(
+            model, cfg, device, train_examples, val_examples, mem_dir,
+            steps=args.phase_d_steps, lr=1e-4, batch_size=32,
+            eval_interval=200, encoder_mode=args.encoder_mode,
+            d1_ratio=args.d1_ratio,
+        )
+
+        # Final report
+        total_time = time.time() - t_start
+        print("\n" + "=" * 60)
+        print("  FINAL REPORT")
+        print("=" * 60)
+        print(f"  Total time:      {total_time:.0f}s ({total_time/60:.1f} min)")
+        print(f"  Parameters:      {n_params:,}")
+        print(f"  Context QA:      {ctx_acc_c:.1%} (passage in context)")
+        print(f"  Memory QA:       {best_acc:.1%} (passage from memory)")
+        print(f"  Target:          >80% memory QA")
+        print(f"  ACT fix:         halt bias [0,0] (50/50 init)")
+
+        # Detailed eval
+        detailed_eval(model, cfg, val_examples, device, n=10,
+                      encoder_mode=args.encoder_mode)
+
+        report = {
+            "total_time_s": total_time,
+            "n_params": n_params,
+            "context_qa_acc": ctx_acc_c,
+            "memory_qa_acc": best_acc,
+            "phases": {
+                "A": {"steps": args.phase_a_steps, "final_loss": loss_a},
+                "B": {"steps": args.phase_b_steps},
+                "C": {"steps": args.phase_c_steps, "context_qa": ctx_acc_c},
+                "D": {"steps": args.phase_d_steps, "best_acc": best_acc},
+            },
+            "config": {
+                "d_model": cfg.d_model, "n_layers": cfg.n_layers,
+                "n_heads": cfg.n_heads, "vocab_size": VOCAB_SIZE,
+            },
+            "device": device,
+        }
+
     report_path = os.path.join(args.output_dir, "report.json")
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2)

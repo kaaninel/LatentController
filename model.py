@@ -134,11 +134,15 @@ class MemoryAttention(nn.Module):
 
     Includes a learnable inverse-temperature per head for sharper attention
     when entity discrimination is needed.
+
+    Supports top-k sparse attention with straight-through estimator (STE):
+    forward uses only top-k slots per query, backward flows through full softmax.
     """
-    def __init__(self, d_model: int, n_heads: int, head_dim: int):
+    def __init__(self, d_model: int, n_heads: int, head_dim: int, topk: int = 0):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = head_dim
+        self.topk = topk
         inner = n_heads * head_dim
 
         self.q = nn.Linear(d_model, inner, bias=False)
@@ -164,14 +168,119 @@ class MemoryAttention(nn.Module):
         temp = self.inv_temp.view(1, H, 1, 1)  # (1, H, 1, 1)
         q = q * temp
 
+        effective_topk = self.topk
+        if effective_topk <= 0 or effective_topk >= S:
+            # Standard softmax attention
+            attn_mask = None
+            if mem_mask is not None:
+                attn_mask = torch.zeros(B, 1, 1, S, device=x.device, dtype=x.dtype)
+                attn_mask.masked_fill_(~mem_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
+        else:
+            # Top-K sparse attention with STE
+            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(D)  # (B,H,T,S)
+
+            if mem_mask is not None:
+                pad_mask = ~mem_mask.unsqueeze(1).unsqueeze(2)  # (B,1,1,S)
+                scores = scores.masked_fill(pad_mask, float('-inf'))
+
+            # Full softmax (used as gradient surrogate)
+            full_attn = F.softmax(scores, dim=-1)
+
+            # Top-k mask: keep only the k highest-scoring slots per query position
+            k_clamped = min(effective_topk, S)
+            topk_vals, _ = scores.topk(k_clamped, dim=-1)        # (B,H,T,k)
+            threshold = topk_vals[..., -1:]                        # (B,H,T,1)
+            topk_mask = (scores >= threshold).float()              # (B,H,T,S)
+
+            # Sparse attention: mask out non-top-k, renormalize
+            sparse_attn = full_attn * topk_mask
+            sparse_attn = sparse_attn / (sparse_attn.sum(dim=-1, keepdim=True) + 1e-8)
+
+            # STE: forward uses sparse_attn, backward flows through full_attn
+            attn = full_attn + (sparse_attn - full_attn).detach()
+
+            out = torch.matmul(attn, v)  # (B, H, T, D)
+
+        out = out.transpose(1, 2).reshape(B, T, H * D)
+        return self.o(out)
+
+
+class MultiHopMemoryAttention(nn.Module):
+    """Two-hop cross-attention: entity identification → attribute retrieval.
+
+    Hop 1 reads memory with the raw decoder query to find the relevant entity.
+    Hop 2 reads memory with a query conditioned on hop 1's output, retrieving
+    the entity's attribute (e.g. location). This decomposes "who?" from
+    "what about them?" which single-hop attention conflates.
+
+    Shared K/V projections (same memory view), separate Q projections per hop.
+    Only adds one extra Q linear per layer vs standard MemoryAttention.
+    """
+    def __init__(self, d_model: int, n_heads: int, head_dim: int, topk: int = 0):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = head_dim
+        self.topk = topk
+        inner = n_heads * head_dim
+
+        self.k = nn.Linear(d_model, inner, bias=False)
+        self.v = nn.Linear(d_model, inner, bias=False)
+        self.q1 = nn.Linear(d_model, inner, bias=False)  # entity query
+        self.q2 = nn.Linear(d_model, inner, bias=False)  # attribute query
+        self.o = nn.Linear(inner, d_model, bias=False)
+
+        self.inv_temp = nn.Parameter(torch.ones(n_heads))
+
+    def _attend(self, q, k, v, attn_mask):
+        """Single-hop attention (softmax or top-k)."""
+        H, D = self.n_heads, self.head_dim
+        S = k.shape[-1]
+
+        if self.topk <= 0 or self.topk >= S:
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(D)
+        if attn_mask is not None:
+            scores = scores + attn_mask
+        full_attn = F.softmax(scores, dim=-1)
+        k_clamped = min(self.topk, scores.shape[-1])
+        topk_vals, _ = scores.topk(k_clamped, dim=-1)
+        topk_mask = (scores >= topk_vals[..., -1:]).float()
+        sparse_attn = full_attn * topk_mask
+        sparse_attn = sparse_attn / (sparse_attn.sum(dim=-1, keepdim=True) + 1e-8)
+        attn = full_attn + (sparse_attn - full_attn).detach()
+        return torch.matmul(attn, v)
+
+    def forward(self, x: torch.Tensor, mem_keys: torch.Tensor,
+                mem_values: torch.Tensor,
+                mem_mask: torch.Tensor | None = None) -> torch.Tensor:
+        B, T, _ = x.shape
+        S = mem_keys.shape[1]
+        H, D = self.n_heads, self.head_dim
+
+        k = self.k(mem_keys).view(B, S, H, D).transpose(1, 2)
+        v = self.v(mem_values).view(B, S, H, D).transpose(1, 2)
+
         attn_mask = None
         if mem_mask is not None:
             attn_mask = torch.zeros(B, 1, 1, S, device=x.device, dtype=x.dtype)
             attn_mask.masked_fill_(~mem_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
 
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
-        out = out.transpose(1, 2).reshape(B, T, H * D)
-        return self.o(out)
+        temp = self.inv_temp.view(1, H, 1, 1)
+
+        # Hop 1: entity identification
+        q1 = self.q1(x).view(B, T, H, D).transpose(1, 2) * temp
+        hop1 = self._attend(q1, k, v, attn_mask)
+        hop1 = hop1.transpose(1, 2).reshape(B, T, H * D)  # (B, T, inner)
+
+        # Hop 2: attribute retrieval conditioned on entity context
+        q2 = self.q2(x + hop1).view(B, T, H, D).transpose(1, 2) * temp
+        hop2 = self._attend(q2, k, v, attn_mask)
+        hop2 = hop2.transpose(1, 2).reshape(B, T, H * D)
+
+        return self.o(hop2)
 
 
 
@@ -190,9 +299,14 @@ class TransformerBlock(nn.Module):
         self.use_mem_attn = getattr(cfg, 'use_memory_cross_attention', False)
         if self.use_mem_attn:
             self.norm_mem = RMSNorm(cfg.d_model)
-            self.mem_attn = MemoryAttention(
-                cfg.d_model, cfg.n_heads, cfg.head_dim
-            )
+            topk = getattr(cfg, 'memory_topk', 0)
+            hops = getattr(cfg, 'memory_hops', 1)
+            if hops >= 2:
+                self.mem_attn = MultiHopMemoryAttention(
+                    cfg.d_model, cfg.n_heads, cfg.head_dim, topk=topk)
+            else:
+                self.mem_attn = MemoryAttention(
+                    cfg.d_model, cfg.n_heads, cfg.head_dim, topk=topk)
 
         self.norm2 = RMSNorm(cfg.d_model)
         self.ffn   = SiLUFFN(cfg.d_model, cfg.ffn_dim)
