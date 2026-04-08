@@ -32,22 +32,23 @@ HF_CHECKPOINT = (
 OUTPUT_DIR = "checkpoints/overnight"
 DEVICE = "mps"  # M4 MacBook Air
 
-# Data
-N_WIKI = 200_000
-N_SHELL = 10_000
-N_QA = 50_000
+# Data — keep small for Phase 3 to avoid RAM explosion
+# Phase 3 runs 3 forward passes/step (LM+QA+Chat) — data size less important
+N_WIKI = 50_000   # reduced from 200K — enough variety, saves RAM
+N_SHELL = 5_000
+N_QA = 20_000     # reduced from 50K — QA already solved at 100%
 N_CHAT = 10_000
 
 # Training — Phase 3 only (QA already 100%, LM at 1.53 from overnight run)
 # Load the best local checkpoint and just do chat + refinement
 PHASE1_STEPS = 0        # skip — LM already solid
 PHASE2_STEPS = 0        # skip — QA already at 100%
-PHASE3_STEPS = 10_000   # ~7h of LM+QA+Chat refinement on M4
+PHASE3_STEPS = 2_000   # ~2h of LM+QA+Chat refinement on M4
 
 BATCH_SIZE = 32  # safe for MPS RAM
 GRAD_ACCUM = 1
 WINDOW_SIZE = 8
-NUM_PASSES = 4  # full quality
+NUM_PASSES = 2  # 2 passes in Phase 3 — halves compute, still good quality
 STRIDE = 1  # MUST be 1 for correct LM training (stride>1 skips positions)
 EVAL_INTERVAL = 500
 
