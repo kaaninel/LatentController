@@ -186,3 +186,5 @@ Invalid username or password.
 Note: Creating a commit assumes that the repo already exists on the Huggingface Hub. Please use `create_repo` if it's not the case.
   [P3  2025/9500] loss=1.1102 lm=1.7296 qa=0.0034 chat=1.5788 gnorm=2.10 lr=3.3e-05 spd=0.1it/s [4116s / ETA 15193s]
   [P3  2050/9500] loss=0.9933 lm=1.4263 qa=0.0020 chat=1.5385 gnorm=2.08 lr=3.3e-05 spd=0.1it/s [4693s / ETA 17055s]
+  [P3  2075/9500] loss=0.9591 lm=1.4864 qa=0.0014 chat=1.3734 gnorm=1.82 lr=3.3e-05 spd=0.1it/s [4904s / ETA 17548s]
+  [P3  2100/9500] loss=1.0330 lm=1.4931 qa=0.0040 chat=1.5880 gnorm=1.66 lr=3.3e-05 spd=0.1it/s [5224s / ETA 18409s]
