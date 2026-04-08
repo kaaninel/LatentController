@@ -482,6 +482,9 @@ def encode_passage(model, passages, device, differentiable=False):
     Uses sliding window to get hidden states, pools per-sentence (split at
     period tokens). Each sentence → one memory slot.
 
+    When differentiable=True, values are routed through V_proj so gradients
+    flow to the value projection during Phase B training.
+
     Returns: (keys, values, mask) as tensors.
     """
     B = passages.size(0)
@@ -508,16 +511,29 @@ def encode_passage(model, passages, device, differentiable=False):
         example_sents.append(sents if sents else [(0, max(clen, 1))])
 
     max_s = max(len(s) for s in example_sents)
-    keys = torch.zeros(B, max_s, d_model, device=device)
-    values = torch.zeros(B, max_s, d_model, device=device)
-    mask = torch.zeros(B, max_s, dtype=torch.bool, device=device)
 
+    # Build keys/values without in-place ops (preserves autograd graph)
+    key_list, val_list, mask_list = [], [], []
     for b in range(B):
-        for si, (s, e) in enumerate(example_sents[b]):
-            h = hidden[b, e - 1]
-            keys[b, si] = h
-            values[b, si] = h
-            mask[b, si] = True
+        bk, bv, bm = [], [], []
+        for si in range(max_s):
+            if si < len(example_sents[b]):
+                s, e = example_sents[b][si]
+                h = hidden[b, e - 1]
+                bk.append(h)
+                bv.append(model.compute_value(h) if differentiable else h)
+                bm.append(True)
+            else:
+                bk.append(torch.zeros(d_model, device=device))
+                bv.append(torch.zeros(d_model, device=device))
+                bm.append(False)
+        key_list.append(torch.stack(bk))
+        val_list.append(torch.stack(bv))
+        mask_list.append(bm)
+
+    keys = torch.stack(key_list)      # (B, max_s, d_model)
+    values = torch.stack(val_list)    # (B, max_s, d_model)
+    mask = torch.tensor(mask_list, dtype=torch.bool, device=device)  # (B, max_s)
 
     return keys, values, mask
 
@@ -653,7 +669,10 @@ def train(model, cfg, device, output_dir,
             return get_lr(s, 100, steps_c, lr * 0.33, lr * 0.01)
 
     def freeze_base(model):
-        """Freeze everything except AddrNets, V_proj, and tag system."""
+        """Freeze base (embed, self-attn, ffn) but keep memory system trainable.
+
+        Trainable: AddrNets, V_proj, tag system, mem_attn, norm_mem.
+        """
         for p in model.parameters():
             p.requires_grad = False
         for net in model.addr_nets:
@@ -670,6 +689,12 @@ def train(model, cfg, device, output_dir,
                     p.requires_grad = True
             if hasattr(layer, "norm_tag"):
                 for p in layer.norm_tag.parameters():
+                    p.requires_grad = True
+            if hasattr(layer, "mem_attn"):
+                for p in layer.mem_attn.parameters():
+                    p.requires_grad = True
+            if hasattr(layer, "norm_mem"):
+                for p in layer.norm_mem.parameters():
                     p.requires_grad = True
 
     def freeze_addr_vproj(model):
@@ -715,7 +740,7 @@ def train(model, cfg, device, output_dir,
         loss_parts = {}
 
         for _ in range(grad_accum):
-            total_loss = torch.tensor(0.0, device=device)
+            losses = []  # collect differentiable losses to sum
             amp_ctx = autocast(amp_device, dtype=amp_dtype) if use_bf16 else nullcontext()
 
             # ── LM loss (all phases) ──
@@ -738,11 +763,11 @@ def train(model, cfg, device, output_dir,
             loss_parts.setdefault("lm", lm_loss.item())
 
             if phase == "A":
-                total_loss = lm_loss
+                losses.append(lm_loss)
             elif phase == "B":
-                total_loss = total_loss + 0.5 * lm_loss
+                pass  # LM loss has no grad when base is frozen; monitor only
             else:
-                total_loss = total_loss + 0.34 * lm_loss
+                losses.append(0.34 * lm_loss)
 
             # ── QA loss with memory (Phase B+) ──
             if phase in ("B", "C"):
@@ -776,11 +801,9 @@ def train(model, cfg, device, output_dir,
                             mem_keys=mk, mem_vals=mv, mem_mask=mm,
                             causal=True, stride=stride)
                     else:
-                        # Phase B: direct tensor encoding (AddrNet gradients flow
-                        # through Gumbel-softmax, V_proj gradients flow through values)
-                        model.eval()
-                        mk, mv, mm = encode_frozen(model, p_t, device)
-                        model.train()
+                        # Phase B: differentiable encoding so gradients flow
+                        # through V_proj (values) and mem_attn (cross-attention)
+                        mk, mv, mm = encode_differentiable(model, p_t, device)
 
                         qa_hidden = sliding_window_encode(
                             model, q_t, window_size, num_passes,
@@ -795,9 +818,9 @@ def train(model, cfg, device, output_dir,
                 loss_parts.setdefault("qa", qa_loss.item())
 
                 if phase == "B":
-                    total_loss = total_loss + 0.5 * qa_loss
+                    losses.append(qa_loss)  # sole gradient source in Phase B
                 else:
-                    total_loss = total_loss + 0.33 * qa_loss
+                    losses.append(0.33 * qa_loss)
 
             # ── Chat loss with memory (Phase C only) ──
             if phase == "C" and chat_iter is not None:
@@ -831,9 +854,12 @@ def train(model, cfg, device, output_dir,
                         ch_tgt.reshape(-1), ignore_index=pad)
 
                 loss_parts.setdefault("chat", ch_loss.item())
-                total_loss = total_loss + 0.33 * ch_loss
+                losses.append(0.33 * ch_loss)
 
             # Backward
+            if not losses:
+                continue  # safety: skip if no differentiable loss
+            total_loss = sum(losses)
             scaled = total_loss / grad_accum
             if scaler is not None:
                 scaler.scale(scaled).backward()
