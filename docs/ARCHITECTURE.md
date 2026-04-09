@@ -270,12 +270,12 @@ Causal sliding window with multi-pass refinement for unlimited context.
 
 ## Training Curriculum
 
-### Phase A — Base Language Model (no memory)
+### Phase A — Base Language Model (with memory)
 
 ```
-  Wiki + Shell → sliding window encode → causal LM loss
-  Purpose: learn language, embeddings, attention patterns
-  Memory: OFF (not used at all)
+  Wiki + Shell + Chat → engine.encode() → causal LM loss
+  Memory: ON from step 1 (trie starts empty, grows)
+  Purpose: learn language AND memory interaction simultaneously
 ```
 
 ### Phase B — Memory Training (frozen base)
@@ -369,14 +369,19 @@ MemoryConfig(
 ## Files
 
 ```
+  ant_memory/          Rust crate (PyO3 extension) — arena-allocated trie
+    Cargo.toml         pyo3 0.24, numpy 0.24, ndarray 0.16, memmap2 0.9
+    src/lib.rs         PyO3 module entry
+    src/trie.rs        HierarchicalTrie: arena nodes, EMA vectors, serialize
+    src/memory.rs      MemorySystem: batch read/write, Python-facing API
+
   config.py           ModelConfig + MemoryConfig
   model.py            ANT transformer (AddrNet, Attention, MemoryAttention,
-                      TransformerBlock, StaticKVCache)
-  memory.py           HierarchicalTrie + MemorySystem (binary serialization)
+                      TransformerBlock, StaticKVCache, ANT)
+  engine.py           Core engine: per-token READ→PROCESS→WRITE cycle
+                      encode() for training, generate() for inference
   data.py             Data pipelines: tokenizer, QA/shell/wiki/chat generators
-  train.py            Training: Phase A/B/C curriculum, trie read/write bridge
-  inference.py        Terminal chat interface (duplex streaming, per-token trie)
+  train.py            Training: Phase A/B/C curriculum using engine
+  inference.py        Terminal chat interface using engine.generate()
   train_colab.ipynb   A100 GPU training notebook
-  benchmark.py        Performance benchmarks
-  model_mlx.py        Apple Silicon MLX inference port
 ```

@@ -17,3 +17,6 @@ logs/
 .DS_Store
 .cache
 *.log
+ant_memory/target/
+*.so
+*.dylib

@@ -1,15 +1,14 @@
 """
 ANT — Data loading, tokenization, and dataset generation.
 
-All data pipelines: byte tokenizer, bAbI QA, shell commands, Wikipedia,
-HF chat, source provenance tags, and torch Dataset/collate utilities.
+Byte tokenizer, bAbI QA, shell commands, Wikipedia, HF chat,
+source provenance tags, and torch Dataset/collate utilities.
 """
 
 import os
 import random
 import re
-from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 from torch.utils.data import Dataset

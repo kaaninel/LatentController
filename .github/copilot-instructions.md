@@ -58,14 +58,15 @@ WHAT was learned.
 
 This cycle happens for EVERY token. Memory is not a separate phase or mode.
 
-### Hierarchical Trie
+### Hierarchical Trie (Rust)
 
 ```
+  Rust extension (ant_memory crate) via PyO3
+  Arena-allocated nodes (no Python object overhead)
   256-ary tree, 8 levels deep, float32 vectors (128-dim) at every node
   Write: EMA blend at leaf + decay-propagate to all ancestors
   Read:  Collect ALL ancestor vectors along 3 paths = up to 25 unique vectors
   Storage: single flat binary file (header + values + write_counts + adjacency)
-  Performance: 34μs write, 7μs read, 3ms load for 9K nodes
 ```
 
 ### AddrNet
@@ -82,11 +83,11 @@ This cycle happens for EVERY token. Memory is not a separate phase or mode.
 ```bash
 source .venv/bin/activate  # Python 3.14, PyTorch, datasets, numpy
 
+# Build Rust memory extension (first time only)
+cd ant_memory && PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 maturin develop --release && cd ..
+
 # Train
 python3 train.py 2>&1 | tee training.log
-
-# A100 training (Colab)
-# Open train_colab.ipynb
 
 # Chat interface
 python3 inference.py
@@ -100,15 +101,16 @@ No linters, formatters, or test suites configured.
 ## Files
 
 ```
+ant_memory/         Rust trie memory (PyO3 extension, arena-allocated)
+  src/trie.rs       HierarchicalTrie: arena nodes, EMA, serialize
+  src/memory.rs     MemorySystem: batch read/write, Python API
 config.py           ModelConfig (937K) + MemoryConfig — single source of truth
 model.py            ANT transformer: AddrNet, MemoryAttention, tag system
-memory.py           HierarchicalTrie: binary serialization, EMA, batch read/write
+engine.py           Core engine: per-token READ→PROCESS→WRITE trie cycle
 data.py             Data pipelines: tokenizer, QA/shell/wiki/chat generators
-train.py            Training: Phase A/B/C curriculum, trie read/write bridge
-inference.py        Terminal chat: duplex streaming, per-token trie read/write
+train.py            Training: Phase A/B/C curriculum using engine
+inference.py        Terminal chat using engine.generate()
 train_colab.ipynb   A100 GPU notebook
-model_mlx.py        Apple Silicon MLX inference port
-benchmark.py        Performance benchmarks
 ```
 
 ## Key Conventions
@@ -140,7 +142,7 @@ GRU-gated persistent register.
 ### Training curriculum
 
 ```
-Phase A: Base LM (no memory) — learn language patterns
+Phase A: Base LM with memory — learn language + memory interaction from day 1
 Phase B: Freeze base, train AddrNet/V_proj/tags — learn stable address space
 Phase C: Unfreeze base (keep AddrNet/V_proj frozen) — learn to use memory
 ```

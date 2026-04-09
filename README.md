@@ -48,11 +48,13 @@ answers questions, and holds conversations.
 ```bash
 pip install -r requirements.txt
 
+# Build Rust memory extension
+cd ant_memory && pip install maturin
+PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 maturin develop --release
+cd ..
+
 # Train
 python3 train.py 2>&1 | tee training.log
-
-# Train (A100 GPU, Colab)
-# Open train_colab.ipynb
 
 # Interactive chat
 python3 inference.py
@@ -133,24 +135,23 @@ Causal sliding window with multi-pass refinement:
 
 ## Training Curriculum
 
-1. **Phase A — Base LM**: Language modeling on wiki + shell (no memory)
+1. **Phase A — Base LM with Memory**: LM on wiki + shell + chat with memory active
 2. **Phase B — Memory Training**: Freeze base, train AddrNet + V_proj + tags
-   with contrastive address loss and depth penalty
+   with QA data (write passage, answer from memory)
 3. **Phase C — End-to-End**: Unfreeze base (keep AddrNet/V_proj frozen),
    every pass reads and writes the trie
 
 ## Files
 
 ```
+ant_memory/         Rust trie memory (PyO3 extension, arena-allocated)
 config.py           ModelConfig (937K) + MemoryConfig
 model.py            ANT transformer: AddrNet, MemoryAttention, tag system
-memory.py           HierarchicalTrie: binary serialization, EMA write, batch read
+engine.py           Core engine: per-token READ→PROCESS→WRITE trie cycle
 data.py             Data pipelines: tokenizer, QA/shell/wiki/chat generators
-train.py            Training: Phase A/B/C curriculum, trie read/write bridge
-inference.py        Terminal chat: duplex streaming, per-token trie read/write
+train.py            Training: Phase A/B/C curriculum using engine
+inference.py        Terminal chat using engine.generate()
 train_colab.ipynb   A100 GPU training notebook
-model_mlx.py        Apple Silicon MLX inference port
-benchmark.py        Performance benchmarks
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full technical details.
