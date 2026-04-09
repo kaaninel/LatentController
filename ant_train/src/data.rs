@@ -111,7 +111,12 @@ impl TextDataset {
         let max_start = if bytes.len() > self.max_len { bytes.len() - self.max_len } else { 0 };
         let start = if max_start > 0 { rng.gen_range(0..max_start) } else { 0 };
         let end = (start + self.max_len - 2).min(bytes.len());
-        make_sample(&text[start..end], self.max_len)
+        // Build sample directly from raw bytes — no char-boundary constraint needed.
+        let byte_slice = &bytes[start..end];
+        let mut sample = vec![BOS_ID as u8];
+        sample.extend_from_slice(&byte_slice[..byte_slice.len().min(self.max_len - 2)]);
+        sample.push(EOS_ID as u8);
+        sample
     }
 }
 
