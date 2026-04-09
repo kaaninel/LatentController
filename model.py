@@ -113,13 +113,17 @@ class AddrNet(nn.Module):
         self.mlp = nn.Linear(hidden_dim, hidden_dim)
         self.out = nn.Linear(hidden_dim, n_bins)
 
-    def forward(self, hidden_state: torch.Tensor, temperature: float = 1.0):
+    def forward(self, hidden_state: torch.Tensor, temperature: float = 1.0,
+                return_logits: bool = False):
         if hidden_state.dim() == 1:
             hidden_state = hidden_state.unsqueeze(0)
         h = self.proj_in(hidden_state)
         bins = []
+        all_logits = []
         for _ in range(self.depth):
             logits = self.out(h)
+            if return_logits:
+                all_logits.append(logits)
             if self.training and temperature > 0:
                 soft = F.gumbel_softmax(logits, tau=temperature, hard=True)
                 bin_idx = soft.argmax(dim=-1)
@@ -129,7 +133,10 @@ class AddrNet(nn.Module):
                 h = h + self.bin_embed(bin_idx)
             h = F.silu(self.mlp(h))
             bins.append(bin_idx)
-        return torch.stack(bins, dim=1)  # (B, depth)
+        addrs = torch.stack(bins, dim=1)  # (B, depth)
+        if return_logits:
+            return addrs, all_logits  # all_logits: list of (B, n_bins) tensors
+        return addrs
 
 
 # ---------------------------------------------------------------------------
@@ -351,10 +358,19 @@ class ANT(nn.Module):
             self.cfg.n_layers, batch_size, self.cfg.n_heads,
             max_seq, self.cfg.head_dim, device, dtype)
 
-    def compute_addresses(self, hidden: torch.Tensor, temperature: float = 1.0):
-        """hidden: (B, d) or (d,) → list of N tensors, each (B, depth) int64."""
+    def compute_addresses(self, hidden: torch.Tensor, temperature: float = 1.0,
+                          return_logits: bool = False):
+        """hidden: (B, d) or (d,) → list of N tensors, each (B, depth) int64.
+        If return_logits=True, also returns list of logit lists for each AddrNet."""
         if hidden.dim() == 1:
             hidden = hidden.unsqueeze(0)
+        if return_logits:
+            addrs, logits = [], []
+            for net in self.addr_nets:
+                a, l = net(hidden, temperature, return_logits=True)
+                addrs.append(a)
+                logits.append(l)
+            return addrs, logits
         return [net(hidden, temperature) for net in self.addr_nets]
 
     def compute_value(self, hidden: torch.Tensor) -> torch.Tensor:

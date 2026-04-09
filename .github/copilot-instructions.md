@@ -142,7 +142,7 @@ GRU-gated persistent register.
 ### Training curriculum
 
 ```
-Phase A: Base LM with memory — learn language + memory interaction from day 1
+Phase A: Base LM (no memory) — learn language patterns
 Phase B: Freeze base, train AddrNet/V_proj/tags — learn stable address space
 Phase C: Unfreeze base (keep AddrNet/V_proj frozen) — learn to use memory
 ```

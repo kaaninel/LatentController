@@ -135,9 +135,9 @@ Causal sliding window with multi-pass refinement:
 
 ## Training Curriculum
 
-1. **Phase A — Base LM with Memory**: LM on wiki + shell + chat with memory active
+1. **Phase A — Base LM**: Language modeling on wiki + shell (no memory)
 2. **Phase B — Memory Training**: Freeze base, train AddrNet + V_proj + tags
-   with QA data (write passage, answer from memory)
+   with contrastive address loss and depth penalty
 3. **Phase C — End-to-End**: Unfreeze base (keep AddrNet/V_proj frozen),
    every pass reads and writes the trie
 

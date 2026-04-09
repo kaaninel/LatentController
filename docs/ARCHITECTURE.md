@@ -270,12 +270,12 @@ Causal sliding window with multi-pass refinement for unlimited context.
 
 ## Training Curriculum
 
-### Phase A — Base Language Model (with memory)
+### Phase A — Base Language Model (no memory)
 
 ```
-  Wiki + Shell + Chat → engine.encode() → causal LM loss
-  Memory: ON from step 1 (trie starts empty, grows)
-  Purpose: learn language AND memory interaction simultaneously
+  Wiki + Shell → sliding window encode → causal LM loss
+  Purpose: learn language, embeddings, attention patterns
+  Memory: OFF (not used at all)
 ```
 
 ### Phase B — Memory Training (frozen base)
