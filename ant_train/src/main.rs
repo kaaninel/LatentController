@@ -91,6 +91,7 @@ fn main() {
         batch_a: parse_usize(&args, "--batch-a", 16),
         batch_b: parse_usize(&args, "--batch-b", 8),
         batch_c: parse_usize(&args, "--batch-c", 8),
+        inner_steps: parse_usize(&args, "--inner-steps", config::INNER_STEPS),
         data_dir: parse_str(&args, "--data-dir", "data_cache"),
         ckpt_dir: parse_str(&args, "--ckpt-dir", "checkpoints/rust"),
         log_every: parse_usize(&args, "--log-every", 50),

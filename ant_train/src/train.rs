@@ -193,6 +193,9 @@ pub struct TrainConfig {
     pub batch_a: usize,
     pub batch_b: usize,
     pub batch_c: usize,
+    /// Gradient steps per trie read/write cycle (Phases B and C).
+    /// Effective batch = batch_b * inner_steps. Default mirrors INNER_STEPS constant.
+    pub inner_steps: usize,
     pub data_dir: String,
     pub ckpt_dir: String,
     pub log_every: usize,
@@ -212,6 +215,7 @@ impl Default for TrainConfig {
             batch_a: 16,
             batch_b: 8,
             batch_c: 8,
+            inner_steps: INNER_STEPS,
             data_dir: "data_cache".to_string(),
             ckpt_dir: "checkpoints/rust".to_string(),
             log_every: 50,
@@ -346,65 +350,99 @@ pub fn phase_b(engine: &mut ANTEngine, cfg: &TrainConfig, vms: &ModelVarMaps,
     while step < cfg.steps_b {
         let temperature = (1.0f32 - step as f32 / cfg.steps_b as f32).max(0.5);
 
-        let (batch_flat, b, t) = random_batch(&dataset, cfg.batch_b, &mut rng);
-
-        // Per-row shift: input = row[0..t-1], target = row[1..t]
-        let t1 = t.saturating_sub(1);
-        let mut input_vec: Vec<u32> = Vec::with_capacity(b * t1);
-        let mut target_vec: Vec<u32> = Vec::with_capacity(b * t1);
-        for bi in 0..b {
-            input_vec.extend_from_slice(&batch_flat[bi*t .. bi*t + t1]);
-            target_vec.extend_from_slice(&batch_flat[bi*t + 1 .. bi*t + t]);
+        // ── Trie read: one pass-1 forward + trie read shared across inner steps ──
+        let (seed_flat, seed_b, seed_t) = random_batch(&dataset, cfg.batch_b, &mut rng);
+        let seed_t1 = seed_t.saturating_sub(1);
+        let mut seed_in: Vec<u32> = Vec::with_capacity(seed_b * seed_t1);
+        for bi in 0..seed_b {
+            seed_in.extend_from_slice(&seed_flat[bi*seed_t .. bi*seed_t + seed_t1]);
         }
-        let input = Tensor::from_vec(input_vec, (b, t1), device)?;
-        let target = Tensor::from_vec(target_vec, (b, t1), device)?;
+        let seed_input = Tensor::from_vec(seed_in, (seed_b, seed_t1), device)?;
+        engine.reset_state(seed_b)?;
+        let (mem_k, mem_v, mem_mask) = engine.read_for_encode(&seed_input, temperature, &mut rng)?;
 
-        // Full encode through engine (two-pass with memory)
-        let (logits, _halt, hidden) = engine.encode(&input, temperature, true, &mut rng)?;
+        // ── Inner gradient loop: INNER_STEPS mini-batches share the same mem_vecs ──
+        let mut accumulated_loss: Option<Tensor> = None;
+        let mut last_hidden: Option<Tensor> = None;
+        let mut inner_lm = 0.0f32;
+        let mut inner_contr = 0.0f32;
+        let mut inner_depth = 0.0f32;
+        let scale = 1.0 / cfg.inner_steps as f64;
 
-        let bt = b * t1;
-        let logits_2d = logits.reshape((bt, VOCAB_SIZE))?;
-        let target_flat = target.flatten_all()?;
-        let l_lm = cross_entropy_with_ignore(&logits_2d, &target_flat, PAD_ID as u32)?;
+        for _inner in 0..cfg.inner_steps {
+            let (batch_flat, b, t) = random_batch(&dataset, cfg.batch_b, &mut rng);
+            let t1 = t.saturating_sub(1);
+            let mut input_vec: Vec<u32> = Vec::with_capacity(b * t1);
+            let mut target_vec: Vec<u32> = Vec::with_capacity(b * t1);
+            for bi in 0..b {
+                input_vec.extend_from_slice(&batch_flat[bi*t .. bi*t + t1]);
+                target_vec.extend_from_slice(&batch_flat[bi*t + 1 .. bi*t + t]);
+            }
+            let input  = Tensor::from_vec(input_vec,  (b, t1), device)?;
+            let target = Tensor::from_vec(target_vec, (b, t1), device)?;
 
-        // Address quality losses
-        let h_mean = hidden.mean(1)?;
-        let (_, addr_logits_a) = engine.model.compute_addresses_with_logits(
-            &h_mean, temperature, false, &mut rng)?;
-        let (_, addr_logits_b) = engine.model.compute_addresses_with_logits(
-            &h_mean, temperature, false, &mut rng)?;
+            let (logits, _halt, hidden) = engine.forward_with_mem(
+                &input, &mem_k, &mem_v, &mem_mask)?;
 
-        let l_contrastive = contrastive_address_loss(&addr_logits_a, &addr_logits_b)?;
-        let l_depth = depth_cost(&addr_logits_a, 0.01)?;
+            let bt = b * t1;
+            let logits_2d  = logits.reshape((bt, VOCAB_SIZE))?;
+            let target_flat = target.flatten_all()?;
+            let l_lm = cross_entropy_with_ignore(&logits_2d, &target_flat, PAD_ID as u32)?;
 
-        let loss = (l_lm.clone() + (l_contrastive.clone() * 0.1)?)?;
-        let loss = (loss + l_depth.clone())?;
+            let h_mean = hidden.mean(1)?;
+            let (_, addr_logits_a) = engine.model.compute_addresses_with_logits(
+                &h_mean, temperature, false, &mut rng)?;
+            let (_, addr_logits_b) = engine.model.compute_addresses_with_logits(
+                &h_mean, temperature, false, &mut rng)?;
 
-        let loss_val = loss.to_scalar::<f32>()?;
+            let l_contrastive = contrastive_address_loss(&addr_logits_a, &addr_logits_b)?;
+            let l_depth = depth_cost(&addr_logits_a, 0.01)?;
+
+            inner_lm    += l_lm.to_scalar::<f32>()?;
+            inner_contr += l_contrastive.to_scalar::<f32>()?;
+            inner_depth += l_depth.to_scalar::<f32>()?;
+
+            let inner_loss = ((l_lm + (l_contrastive * 0.1)?)? + l_depth)?;
+            let inner_loss_scaled = (inner_loss * scale)?;
+
+            accumulated_loss = Some(match accumulated_loss {
+                None      => inner_loss_scaled,
+                Some(acc) => (acc + inner_loss_scaled)?,
+            });
+            last_hidden = Some(hidden);
+        }
+
+        let total_loss = accumulated_loss.unwrap();
+        let loss_val = total_loss.to_scalar::<f32>()?;
         if loss_val.is_nan() || loss_val.is_infinite() {
             eprintln!("  NaN/inf loss at step {}, skipping", step);
             step += 1;
             continue;
         }
 
-        opt.backward_step(&loss)?;
+        opt.backward_step(&total_loss)?;
+
+        // ── Trie write: once per cycle using the last inner step's hidden states ──
+        if let Some(h) = last_hidden {
+            engine.write_hidden(&h, temperature, &mut rng)?;
+        }
 
         step += 1;
-        running_lm += l_lm.to_scalar::<f32>()?;
-        running_contr += l_contrastive.to_scalar::<f32>()?;
-        running_depth += l_depth.to_scalar::<f32>()?;
+        running_lm    += inner_lm    / cfg.inner_steps as f32;
+        running_contr += inner_contr / cfg.inner_steps as f32;
+        running_depth += inner_depth / cfg.inner_steps as f32;
 
         if step % cfg.log_every == 0 {
             let elapsed = t0.elapsed().as_secs_f32();
             let its = cfg.log_every as f32 / elapsed;
             let (nodes, entries) = engine.memory_stats();
             println!(
-                "  B step {}/{} | lm {:.4} contr {:.4} depth {:.4} | {:.1} it/s | trie {} nodes",
+                "  B step {}/{} | lm {:.4} contr {:.4} depth {:.4} | {:.1} it/s ({} inner) | trie {} nodes",
                 step, cfg.steps_b,
-                running_lm / cfg.log_every as f32,
+                running_lm    / cfg.log_every as f32,
                 running_contr / cfg.log_every as f32,
                 running_depth / cfg.log_every as f32,
-                its, nodes
+                its, cfg.inner_steps, nodes
             );
             running_lm = 0.0; running_contr = 0.0; running_depth = 0.0;
             t0 = Instant::now();
@@ -455,46 +493,78 @@ pub fn phase_c(engine: &mut ANTEngine, cfg: &TrainConfig, vms: &ModelVarMaps,
     let mut t0 = Instant::now();
 
     while step < cfg.steps_c {
-        let (batch_flat, b, t) = random_batch(&dataset, cfg.batch_c, &mut rng);
-
-        engine.reset_state(b)?;
-        // Per-row shift: input = row[0..t-1], target = row[1..t]
-        let t1 = t.saturating_sub(1);
-        let mut input_vec: Vec<u32> = Vec::with_capacity(b * t1);
-        let mut target_vec: Vec<u32> = Vec::with_capacity(b * t1);
-        for bi in 0..b {
-            input_vec.extend_from_slice(&batch_flat[bi*t .. bi*t + t1]);
-            target_vec.extend_from_slice(&batch_flat[bi*t + 1 .. bi*t + t]);
+        // ── Trie read: shared across inner steps ──
+        let (seed_flat, seed_b, seed_t) = random_batch(&dataset, cfg.batch_c, &mut rng);
+        let seed_t1 = seed_t.saturating_sub(1);
+        let mut seed_in: Vec<u32> = Vec::with_capacity(seed_b * seed_t1);
+        for bi in 0..seed_b {
+            seed_in.extend_from_slice(&seed_flat[bi*seed_t .. bi*seed_t + seed_t1]);
         }
-        let input = Tensor::from_vec(input_vec, (b, t1), device)?;
-        let target = Tensor::from_vec(target_vec, (b, t1), device)?;
+        let seed_input = Tensor::from_vec(seed_in, (seed_b, seed_t1), device)?;
+        engine.reset_state(seed_b)?;
+        let (mem_k, mem_v, mem_mask) = engine.read_for_encode(&seed_input, 1.0, &mut rng)?;
 
-        let (logits, _halt, _hidden) = engine.encode(&input, 1.0, true, &mut rng)?;
+        // ── Inner gradient loop ──
+        let mut accumulated_loss: Option<Tensor> = None;
+        let mut last_hidden: Option<Tensor> = None;
+        let scale = 1.0 / cfg.inner_steps as f64;
 
-        let bt = b * t1;
-        let logits_2d = logits.reshape((bt, VOCAB_SIZE))?;
-        let target_flat = target.flatten_all()?;
-        let loss = cross_entropy_with_ignore(&logits_2d, &target_flat, PAD_ID as u32)?;
+        for _inner in 0..cfg.inner_steps {
+            let (batch_flat, b, t) = random_batch(&dataset, cfg.batch_c, &mut rng);
+            let t1 = t.saturating_sub(1);
+            let mut input_vec: Vec<u32> = Vec::with_capacity(b * t1);
+            let mut target_vec: Vec<u32> = Vec::with_capacity(b * t1);
+            for bi in 0..b {
+                input_vec.extend_from_slice(&batch_flat[bi*t .. bi*t + t1]);
+                target_vec.extend_from_slice(&batch_flat[bi*t + 1 .. bi*t + t]);
+            }
+            let input  = Tensor::from_vec(input_vec,  (b, t1), device)?;
+            let target = Tensor::from_vec(target_vec, (b, t1), device)?;
 
-        let loss_val = loss.to_scalar::<f32>()?;
+            let (logits, _halt, hidden) = engine.forward_with_mem(
+                &input, &mem_k, &mem_v, &mem_mask)?;
+
+            let bt = b * t1;
+            let logits_2d  = logits.reshape((bt, VOCAB_SIZE))?;
+            let target_flat = target.flatten_all()?;
+            let l = cross_entropy_with_ignore(&logits_2d, &target_flat, PAD_ID as u32)?;
+
+            running_loss += l.to_scalar::<f32>()?;
+
+            let l_scaled = (l * scale)?;
+            accumulated_loss = Some(match accumulated_loss {
+                None      => l_scaled,
+                Some(acc) => (acc + l_scaled)?,
+            });
+            last_hidden = Some(hidden);
+        }
+
+        let total_loss = accumulated_loss.unwrap();
+        let loss_val = total_loss.to_scalar::<f32>()?;
         if loss_val.is_nan() || loss_val.is_infinite() {
             eprintln!("  NaN/inf loss at step {}, skipping", step);
             step += 1;
             continue;
         }
 
-        opt.backward_step(&loss)?;
+        opt.backward_step(&total_loss)?;
+
+        // ── Trie write: once per cycle ──
+        if let Some(h) = last_hidden {
+            engine.write_hidden(&h, 1.0, &mut rng)?;
+        }
 
         step += 1;
-        running_loss += loss_val;
 
         if step % cfg.log_every == 0 {
             let elapsed = t0.elapsed().as_secs_f32();
             let its = cfg.log_every as f32 / elapsed;
             let (nodes, _) = engine.memory_stats();
             println!(
-                "  C step {}/{} | loss {:.4} | {:.1} it/s | trie {} nodes",
-                step, cfg.steps_c, running_loss / cfg.log_every as f32, its, nodes
+                "  C step {}/{} | loss {:.4} | {:.1} it/s ({} inner) | trie {} nodes",
+                step, cfg.steps_c,
+                running_loss / (cfg.log_every * cfg.inner_steps) as f32,
+                its, cfg.inner_steps, nodes
             );
             running_loss = 0.0;
             t0 = Instant::now();

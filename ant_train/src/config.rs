@@ -47,3 +47,17 @@ pub const MEM_EMA_ALPHA_BASE: f32 = 0.1;
 pub const MEM_EMA_ALPHA_MIN: f32 = 0.001;
 pub const MEM_DEPTH_CAP: usize = 8;
 pub const MEM_FLUSH_INTERVAL: u64 = 1000;
+
+// ---------------------------------------------------------------------------
+// Training inner-loop configuration
+// ---------------------------------------------------------------------------
+
+/// Number of gradient steps per trie read/write cycle (Phases B and C).
+///
+/// One trie read is shared across INNER_STEPS mini-batches, then one trie write.
+/// This amortises trie I/O cost: GPU runs INNER_STEPS forward+backward passes
+/// while the trie thread only does 1 read and 1 write per cycle.
+///
+/// Effective batch size = batch_b * INNER_STEPS  (e.g. 512 * 8 = 4096)
+/// Learning rate should scale as lr / sqrt(INNER_STEPS) relative to 1-step baseline.
+pub const INNER_STEPS: usize = 8;

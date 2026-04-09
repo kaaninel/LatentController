@@ -109,10 +109,75 @@ impl ANTEngine {
     }
 
     // ---------------------------------------------------------------------------
-    // Training encode — two-pass
+    // Training encode — two-pass (full, single-step)
     // ---------------------------------------------------------------------------
 
-    /// Two-pass training encode.
+    /// Pass-1 only: run a no-memory forward pass to compute h_mean, then read
+    /// the trie and return cached memory vectors.
+    ///
+    /// Use this once per trie cycle before calling `forward_with_mem` in a loop.
+    /// The returned tensors are detached — no gradients flow through them.
+    pub fn read_for_encode(&self, token_ids: &Tensor, temperature: f32,
+                           rng: &mut impl Rng)
+        -> Result<(Tensor, Tensor, Tensor)>
+    {
+        let tag = self.tag_register.as_ref().map(|t| t.clone());
+        let (_, _, hidden_p1) = self.model.forward(
+            &token_ids.detach(), None, None, None, tag.as_ref(), None)?;
+        let h_mean = hidden_p1.mean(1)?.detach();
+        self.read_memory(&h_mean, temperature, rng)
+    }
+
+    /// Pass-2 only: forward with pre-loaded (detached) memory vectors.
+    ///
+    /// No trie I/O — use the tensors returned by `read_for_encode`.
+    /// Updates `tag_register` with the last-token hidden state of this batch.
+    pub fn forward_with_mem(&mut self, token_ids: &Tensor,
+                            mem_k: &Tensor, mem_v: &Tensor, mem_mask: &Tensor)
+        -> Result<(Tensor, Tensor, Tensor)>
+    {
+        let b = token_ids.dim(0)?;
+        if self.tag_register.is_none() || self.tag_register.as_ref().unwrap().dim(0)? != b {
+            self.reset_state(b)?;
+        }
+        let tag = self.tag_register.as_ref().map(|t| t.clone());
+        let (logits, halt_logits, hidden) = self.model.forward(
+            token_ids, Some(mem_k), Some(mem_v), Some(mem_mask),
+            tag.as_ref(), None)?;
+
+        // Update tag register: last-token hidden per batch item
+        let mut last_rows: Vec<Tensor> = Vec::with_capacity(b);
+        for bi in 0..b {
+            let seq = hidden.get(bi)?;
+            let last = seq.get(seq.dim(0)? - 1)?.unsqueeze(0)?;
+            last_rows.push(last);
+        }
+        let last_hidden = Tensor::cat(&last_rows, 0)?;
+        self.tag_register = Some(last_hidden.detach());
+
+        Ok((logits, halt_logits, hidden))
+    }
+
+    /// Write a full (B, T, d) hidden tensor to the trie — one write per token.
+    ///
+    /// Use this once per trie cycle after the inner gradient loop completes.
+    pub fn write_hidden(&self, hidden: &Tensor, temperature: f32,
+                        rng: &mut impl Rng) -> Result<()>
+    {
+        let (b, t, _) = hidden.dims3()?;
+        for ti in 0..t {
+            let mut h_rows: Vec<Tensor> = Vec::with_capacity(b);
+            for bi in 0..b {
+                let h_t = hidden.get(bi)?.get(ti)?.unsqueeze(0)?;
+                h_rows.push(h_t);
+            }
+            let h_batch = Tensor::cat(&h_rows, 0)?;
+            self.write_memory(&h_batch.detach(), temperature, rng)?;
+        }
+        Ok(())
+    }
+
+    /// Two-pass training encode (single-step convenience wrapper).
     ///
     /// Pass 1: forward WITHOUT memory → get processed hidden states → addresses
     /// Pass 2: forward WITH memory (cross-attn) → logits, hidden for loss
