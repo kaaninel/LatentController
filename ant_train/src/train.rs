@@ -201,6 +201,10 @@ pub struct TrainConfig {
     pub log_every: usize,
     pub save_every: usize,
     pub max_seq_len: usize,
+    /// Which phase to start from: 0=A (default), 1=B (skip A), 2=C (skip A+B).
+    pub start_phase: u8,
+    /// Optional checkpoint path to load weights from before training begins.
+    pub load_ckpt: Option<String>,
 }
 
 impl Default for TrainConfig {
@@ -221,6 +225,8 @@ impl Default for TrainConfig {
             log_every: 50,
             save_every: 500,
             max_seq_len: MAX_SEQ_LEN,
+            start_phase: 0,
+            load_ckpt: None,
         }
     }
 }
@@ -435,13 +441,17 @@ pub fn phase_b(engine: &mut ANTEngine, cfg: &TrainConfig, vms: &ModelVarMaps,
             let elapsed = t0.elapsed().as_secs_f32();
             let its = cfg.log_every as f32 / elapsed;
             let (nodes, entries) = engine.memory_stats();
+            let gpu_str = match gpu_stats() {
+                Some((util, used, total)) => format!(" | gpu {}% {}/{}MB", util, used, total),
+                None => String::new(),
+            };
             println!(
-                "  B step {}/{} | lm {:.4} contr {:.4} depth {:.4} | {:.1} it/s ({} inner) | trie {} nodes",
+                "  B step {}/{} | lm {:.4} contr {:.4} depth {:.4} | {:.1} it/s ({} inner) | trie {} nodes{}",
                 step, cfg.steps_b,
                 running_lm    / cfg.log_every as f32,
                 running_contr / cfg.log_every as f32,
                 running_depth / cfg.log_every as f32,
-                its, cfg.inner_steps, nodes
+                its, cfg.inner_steps, nodes, gpu_str
             );
             running_lm = 0.0; running_contr = 0.0; running_depth = 0.0;
             t0 = Instant::now();
@@ -557,11 +567,15 @@ pub fn phase_c(engine: &mut ANTEngine, cfg: &TrainConfig, vms: &ModelVarMaps,
             let elapsed = t0.elapsed().as_secs_f32();
             let its = cfg.log_every as f32 / elapsed;
             let (nodes, _) = engine.memory_stats();
+            let gpu_str = match gpu_stats() {
+                Some((util, used, total)) => format!(" | gpu {}% {}/{}MB", util, used, total),
+                None => String::new(),
+            };
             println!(
-                "  C step {}/{} | loss {:.4} | {:.1} it/s ({} inner) | trie {} nodes",
+                "  C step {}/{} | loss {:.4} | {:.1} it/s ({} inner) | trie {} nodes{}",
                 step, cfg.steps_c,
                 running_loss / (cfg.log_every * cfg.inner_steps) as f32,
-                its, cfg.inner_steps, nodes
+                its, cfg.inner_steps, nodes, gpu_str
             );
             running_loss = 0.0;
             t0 = Instant::now();
@@ -575,6 +589,59 @@ pub fn phase_c(engine: &mut ANTEngine, cfg: &TrainConfig, vms: &ModelVarMaps,
 
     let _ = save_checkpoint(vms, step, "C", &cfg.ckpt_dir);
     engine.flush();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GPU stats (best-effort: calls nvidia-smi if available)
+// ---------------------------------------------------------------------------
+
+/// Returns (gpu_util_pct, mem_used_mb, mem_total_mb) if nvidia-smi is available.
+fn gpu_stats() -> Option<(u32, u32, u32)> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=utilization.gpu,memory.used,memory.total",
+               "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let parts: Vec<&str> = s.trim().split(',').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let util  = parts[0].trim().parse::<u32>().ok()?;
+    let used  = parts[1].trim().parse::<u32>().ok()?;
+    let total = parts[2].trim().parse::<u32>().ok()?;
+    Some((util, used, total))
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint loader
+// ---------------------------------------------------------------------------
+
+/// Load all tensors from a safetensors file into the given VarMaps.
+/// Silently skips tensors not present in any VarMap (e.g. from a different phase).
+pub fn load_checkpoint(path: &str, vms: &ModelVarMaps, device: &Device) -> Result<()> {
+    use candle_core::safetensors::load;
+    let tensors = load(path, device)?;
+    let mut loaded = 0usize;
+    let mut skipped = 0usize;
+    for vm in [&vms.base, &vms.addr, &vms.mem] {
+        let data = vm.data().lock().unwrap();
+        for (key, var) in data.iter() {
+            if let Some(t) = tensors.get(key) {
+                if var.shape() == t.shape() {
+                    var.set(t)?;
+                    loaded += 1;
+                } else {
+                    eprintln!("  Shape mismatch for '{}': have {:?}, got {:?}", key, var.shape(), t.shape());
+                    skipped += 1;
+                }
+            } else {
+                skipped += 1;
+            }
+        }
+    }
+    println!("  Loaded {} tensors from {} ({} skipped)", loaded, path, skipped);
     Ok(())
 }
 
@@ -595,8 +662,23 @@ pub fn run(cfg: TrainConfig, device: Device) -> Result<()> {
     let mem_n  = ModelVarMaps::count_params(&vms.mem.all_vars());
     println!("  Total params: {} (base={} addr={} mem={})", total, base_n, addr_n, mem_n);
 
-    phase_a(&mut engine, &cfg, &vms, &device)?;
-    phase_b(&mut engine, &cfg, &vms, &device)?;
+    if let Some(ref ckpt) = cfg.load_ckpt {
+        println!("  Loading checkpoint: {}", ckpt);
+        load_checkpoint(ckpt, &vms, &device)?;
+    }
+
+    if cfg.start_phase == 0 {
+        phase_a(&mut engine, &cfg, &vms, &device)?;
+    } else {
+        println!("  Skipping Phase A (start_phase={})", cfg.start_phase);
+    }
+
+    if cfg.start_phase <= 1 {
+        phase_b(&mut engine, &cfg, &vms, &device)?;
+    } else {
+        println!("  Skipping Phase B (start_phase={})", cfg.start_phase);
+    }
+
     phase_c(&mut engine, &cfg, &vms, &device)?;
 
     println!("\nTraining complete.");

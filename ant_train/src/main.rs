@@ -75,6 +75,32 @@ fn parse_str<'a>(args: &'a [String], flag: &str, default: &'a str) -> String {
     default.to_string()
 }
 
+fn parse_optional_str(args: &[String], flag: &str) -> Option<String> {
+    for i in 0..args.len() {
+        if args[i] == flag && i + 1 < args.len() {
+            return Some(args[i + 1].clone());
+        }
+    }
+    None
+}
+
+fn parse_start_phase(args: &[String]) -> u8 {
+    for i in 0..args.len() {
+        if args[i] == "--start-phase" && i + 1 < args.len() {
+            return match args[i + 1].to_lowercase().as_str() {
+                "a" | "0" => 0,
+                "b" | "1" => 1,
+                "c" | "2" => 2,
+                other => {
+                    eprintln!("Unknown --start-phase '{}', using A", other);
+                    0
+                }
+            };
+        }
+    }
+    0
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
 
@@ -97,6 +123,8 @@ fn main() {
         log_every: parse_usize(&args, "--log-every", 50),
         save_every: parse_usize(&args, "--save-every", 500),
         max_seq_len: parse_usize(&args, "--max-seq-len", config::MAX_SEQ_LEN),
+        start_phase: parse_start_phase(&args),
+        load_ckpt: parse_optional_str(&args, "--load-ckpt"),
     };
 
     if let Err(e) = train::run(cfg, device) {
